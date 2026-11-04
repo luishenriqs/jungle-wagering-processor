@@ -1,0 +1,55 @@
+import { expect, test } from 'bun:test';
+import { Money } from '../../src/shared/domain/money';
+import { Wallet } from '../../src/modules/wallets/domain/wallet';
+import { LedgerDirection, type WalletLedgerEntry } from '../../src/modules/wallets/domain/wallet-ledger-entry';
+import { FailureCode } from '../../src/modules/wagering/domain/failure-code';
+import { WagerTransaction as Tx, WagerTransactionKind as K } from '../../src/modules/wagering/domain/wager-transaction';
+import { evaluateWager } from '../../src/modules/wagering/domain/wager-rules';
+import { at, createTransactionProps, m } from '../fixtures';
+
+// Sequential domain evidence only. This does not implement transaction orchestration or prove concurrency.
+test('opening, accepted BET, rejected BET and LOSS reconcile to ledger with correct versions', () => {
+  const wallet = Wallet.open({ id: 'wallet', playerId: 'player', initialBalance: m('100.00'), at, opening: { transactionId: 'opening', ledgerEntryId: 'opening-entry' } });
+  const entries: WalletLedgerEntry[] = [wallet.openingEntry!];
+  const bet = Tx.create(createTransactionProps({ money: m('80.00') }));
+  expect(evaluateWager(bet, { walletId: wallet.id, playerId: wallet.playerId, balance: wallet.balance, referenceAlreadyReversed: false }).status).toBe('PROCESSED');
+  entries.push(wallet.debit({ transactionId: bet.id, ledgerEntryId: 'bet-entry', money: bet.money, at }));
+  bet.markProcessed(undefined, at, wallet.balance);
+  const rejected = Tx.create(createTransactionProps({ id: 'tx2', externalTransactionId: 'bet2', money: m('80.00') }));
+  const decision = evaluateWager(rejected, { walletId: wallet.id, playerId: wallet.playerId, balance: wallet.balance, referenceAlreadyReversed: false });
+  expect(decision).toEqual({ status: 'REJECTED', code: FailureCode.InsufficientFundsBet });
+  rejected.reject(FailureCode.InsufficientFundsBet, wallet.balance);
+  const loss = Tx.create(createTransactionProps({ id: 'loss', kind: K.Loss, money: m('80.00') }));
+  expect(loss.ledgerDirectionFor()).toBeUndefined();
+  loss.markProcessed(undefined, at, wallet.balance);
+  expect(wallet.version).toBe(2);
+  expect(entries).toHaveLength(2);
+  expect(wallet.balance.toString()).toBe('20.00');
+  const reconstructed = entries.reduce((balance, entry) => entry.direction === LedgerDirection.Credit ? balance.add(entry.money) : balance.subtract(entry.money), Money.zero(wallet.currency));
+  expect(reconstructed.equals(wallet.balance)).toBe(true);
+  wallet.credit({ transactionId: 'later', ledgerEntryId: 'later-entry', money: m('5.00'), at });
+  expect(bet.recordedBalance?.toString()).toBe('20.00');
+  expect(rejected.recordedBalance?.toString()).toBe('20.00');
+});
+test('BET -> REFUND -> ROLLBACK(ref REFUND), crossed reversal blocked', () => {
+  const wallet = Wallet.open({ id: 'wallet', playerId: 'player', initialBalance: m('100.00'), at, opening: { transactionId: 'opening', ledgerEntryId: 'opening-entry' } });
+  const entries = [wallet.openingEntry!];
+  const bet = Tx.create(createTransactionProps());
+  entries.push(wallet.debit({ transactionId: bet.id, ledgerEntryId: 'bet-entry', money: bet.money, at }));
+  bet.markProcessed(undefined, at, wallet.balance);
+  const refund = Tx.create(createTransactionProps({ id: 'refund', kind: K.Refund, externalTransactionId: 'refund-ext', referenceExternalTransactionId: bet.externalTransactionId }));
+  const context = () => ({ walletId: wallet.id, playerId: wallet.playerId, balance: wallet.balance, referenceAlreadyReversed: false });
+  expect(evaluateWager(refund, { ...context(), reference: bet }).status).toBe('PROCESSED');
+  entries.push(wallet.credit({ transactionId: refund.id, ledgerEntryId: 'refund-entry', money: refund.money, at }));
+  refund.markProcessed(bet.id, at, wallet.balance);
+  const crossed = Tx.create(createTransactionProps({ id: 'crossed', kind: K.Rollback, externalTransactionId: 'crossed-ext', referenceExternalTransactionId: bet.externalTransactionId }));
+  expect(evaluateWager(crossed, { ...context(), reference: bet, referenceAlreadyReversed: true })).toEqual({ status: 'REJECTED', code: FailureCode.ReferenceAlreadyReversed });
+  const rollback = Tx.create(createTransactionProps({ id: 'rollback', kind: K.Rollback, externalTransactionId: 'rollback-ext', referenceExternalTransactionId: refund.externalTransactionId }));
+  expect(evaluateWager(rollback, { ...context(), reference: refund })).toEqual({ status: 'PROCESSED', direction: LedgerDirection.Debit });
+  entries.push(wallet.debit({ transactionId: rollback.id, ledgerEntryId: 'rollback-entry', money: rollback.money, at, insufficientFundsCode: FailureCode.InsufficientFundsReversal }));
+  rollback.markProcessed(refund.id, at, wallet.balance);
+  expect(wallet.balance.toString()).toBe('90.00');
+  expect(wallet.version).toBe(4);
+  const reconstructed = entries.reduce((balance, entry) => entry.direction === LedgerDirection.Credit ? balance.add(entry.money) : balance.subtract(entry.money), Money.zero('BRL'));
+  expect(reconstructed.equals(wallet.balance)).toBe(true);
+});
