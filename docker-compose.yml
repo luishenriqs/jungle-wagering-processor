@@ -1,0 +1,35 @@
+name: jungle
+services:
+  postgres:
+    image: postgres:16.6
+    environment:
+      POSTGRES_DB: jungle_dev
+      POSTGRES_USER: ${JUNGLE_DB_USER:-jungle}
+      POSTGRES_PASSWORD: ${JUNGLE_DB_PASSWORD:?Set JUNGLE_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:${JUNGLE_DB_PORT:-5433}:5432"
+    volumes:
+      - jungle_postgres_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d jungle_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+  postgres-test:
+    image: postgres:16.6
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: jungle_test
+      POSTGRES_USER: jungle_test
+      POSTGRES_PASSWORD: ${JUNGLE_TEST_DB_PASSWORD:?Set JUNGLE_TEST_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:${JUNGLE_TEST_DB_PORT:-5434}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jungle_test -d jungle_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+volumes:
+  jungle_postgres_dev:

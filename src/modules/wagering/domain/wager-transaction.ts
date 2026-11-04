@@ -56,6 +56,9 @@ export class WagerTransaction {
       throw new InvalidDomainInputError('Amount must be positive, or zero for LOSS');
     }
     const requiresReference = props.kind === WagerTransactionKind.Refund || props.kind === WagerTransactionKind.Rollback;
+    if ((props.kind === WagerTransactionKind.Bet || props.kind === WagerTransactionKind.Loss) && props.referenceExternalTransactionId !== undefined) {
+      throw new InvalidDomainInputError('BET and LOSS do not admit references');
+    }
     if (requiresReference || props.referenceExternalTransactionId !== undefined) requireText(props.referenceExternalTransactionId ?? '', 'referenceExternalTransactionId');
     if (props.referenceExternalTransactionId === props.externalTransactionId) throw new InvalidDomainInputError('Self reference is invalid');
     return new WagerTransaction({ ...props, status: WagerTransactionStatus.Pending, attempts: 0 });
@@ -95,6 +98,7 @@ export class WagerTransaction {
     this.assertBalance(balance);
     const processedAt = dateCopy(at);
     if (this.expectsReference()) requireText(referenceTransactionId ?? '', 'referenceTransactionId');
+    if (!this.expectsReference() && referenceTransactionId !== undefined) throw new InvalidDomainInputError('Unexpected internal reference');
     if (referenceTransactionId !== undefined) requireText(referenceTransactionId, 'referenceTransactionId');
     this.#state = Object.freeze({ ...this.#state, status: WagerTransactionStatus.Processed, referenceTransactionId,
       processedAt, recordedBalance: balance, nextRetryAt: undefined, expiresAt: undefined });
@@ -111,14 +115,29 @@ export class WagerTransaction {
   reject(code: FailureCode, balance: Money): void {
     this.assertMutable();
     this.assertCode(code);
-    this.assertBalance(balance);
+    // A currency rejection records the wallet's observed balance, not the invalid operation currency.
+    if (code === FailureCode.CurrencyMismatch) {
+      if (balance.isNegative()) throw new InvalidDomainInputError('Snapshot balance cannot be negative');
+    } else this.assertBalance(balance);
     this.#state = Object.freeze({ ...this.#state, status: WagerTransactionStatus.Rejected, failureCode: code,
       recordedBalance: balance, nextRetryAt: undefined, expiresAt: undefined });
   }
-  fail(code: FailureCode): void {
+  reschedulePendingReference(next: Date): void {
+    this.assertMutable();
+    if (this.status !== WagerTransactionStatus.PendingReference || !this.#state.nextRetryAt || !this.#state.expiresAt) {
+      throw new InvalidTransactionStateError('Only PENDING_REFERENCE can be rescheduled');
+    }
+    const nextRetryAt = dateCopy(next);
+    if (nextRetryAt.getTime() <= this.#state.nextRetryAt.getTime() || nextRetryAt.getTime() >= this.#state.expiresAt.getTime()
+      || this.attempts >= 2147483647) throw new InvalidDomainInputError('Invalid retry schedule or attempts overflow');
+    this.#state = Object.freeze({ ...this.#state, attempts: this.attempts + 1, nextRetryAt });
+  }
+  fail(code: FailureCode, balance?: Money): void {
     this.assertMutable();
     this.assertCode(code);
-    this.#state = Object.freeze({ ...this.#state, status: WagerTransactionStatus.Failed, failureCode: code, nextRetryAt: undefined, expiresAt: undefined });
+    if (balance) this.assertBalance(balance);
+    this.#state = Object.freeze({ ...this.#state, status: WagerTransactionStatus.Failed, failureCode: code,
+      recordedBalance: balance ?? this.#state.recordedBalance, nextRetryAt: undefined, expiresAt: undefined });
   }
   isTerminal(): boolean { return [WagerTransactionStatus.Processed, WagerTransactionStatus.Rejected, WagerTransactionStatus.Failed].includes(this.status); }
   affectsBalance(): boolean { return this.kind !== WagerTransactionKind.Loss; }
