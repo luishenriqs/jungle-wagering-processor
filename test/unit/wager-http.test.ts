@@ -142,3 +142,63 @@ test('default HTTP composition without DATABASE_URL has no ORM initialization an
     if (previous === undefined) delete process.env['DATABASE_URL']; else process.env['DATABASE_URL'] = previous;
   }
 });
+
+import type { FinancialStore } from '../../src/shared/application/financial-store';
+
+for (const path of [`/wagering/transactions/${valid.walletId}`, '/providers/provider-test/wagering/transactions/external-test']) {
+  test(`CP03 absent transaction GET ${path} uses WAGER_NOT_FOUND envelope`, async () => {
+    const store = { async getWager() { return undefined; }, async findWager() { return undefined; } } as unknown as FinancialStore;
+    const app = await NestFactory.create(AppModule.register({ uow: { run: work => work(store) } }), { logger: false, abortOnError: false });
+    try {
+      await app.listen(0, '127.0.0.1');
+      const response = await fetch(`${await app.getUrl()}${path}`);
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ code: 'WAGER_NOT_FOUND', message: 'Wager transaction not found' });
+    } finally { await app.close(); }
+  });
+}
+
+import { WagerNotFoundError, NotFoundError } from '../../src/shared/application/application-errors';
+import { publicHttpError } from '../../src/shared/infrastructure/http-exception.filter';
+import { toWagerHttpResponse, wagerQueryText } from '../../src/modules/wagering/infrastructure/wager-http.dto';
+import { WagerTransaction } from '../../src/modules/wagering/domain/wager-transaction';
+import { Money } from '../../src/shared/domain/money';
+
+for (const value of [undefined, null, 1, [], {}, '', ' ', ' provider', 'provider ', '\tprovider', 'provider\n']) {
+  test(`CP03 external query identifier rejects ${JSON.stringify(value)}`, () => expect(() => wagerQueryText(value)).toThrow());
+}
+test('CP03 query projection includes exact public fields and nulls, including PENDING and OPENING', () => {
+  expect(wagerQueryText('SYSTEM')).toBe('SYSTEM'); expect(wagerQueryText('external:test-01')).toBe('external:test-01');
+  const createdAt = new Date('2026-11-05T12:00:00.123Z');
+  const state = { ...valid, id: valid.walletId, kind: K.Bet, money: Money.from(valid.money), idempotencyKey: 'private-key', payloadHash: 'a'.repeat(64),
+    status: S.Pending, createdAt, attempts: 9, nextRetryAt: createdAt, expiresAt: createdAt };
+  const expected = { transactionId: state.id, providerId: state.providerId, externalTransactionId: state.externalTransactionId, walletId: state.walletId,
+    playerId: state.playerId, roundId: state.roundId, gameId: state.gameId, kind: K.Bet, money: valid.money, status: S.Pending, createdAt: createdAt.toISOString(),
+    recordedBalance: null, referenceExternalTransactionId: null, referenceTransactionId: null, failureCode: null, processedAt: null };
+  expect(toWagerHttpResponse(WagerTransaction.rehydrate(state))).toEqual(expected);
+  expect(toWagerHttpResponse(WagerTransaction.rehydrate({ ...state, kind: K.Opening, providerId: 'SYSTEM' }))).toEqual({ ...expected, kind: K.Opening, providerId: 'SYSTEM' });
+});
+test('CP03 WagerNotFoundError preserves hierarchy and sanitized resource mapping', () => {
+  const error = new WagerNotFoundError('private SQL connection details');
+  expect(error).toBeInstanceOf(NotFoundError);
+  expect(publicHttpError(error)).toEqual({ status: 404, code: 'WAGER_NOT_FOUND', message: 'Wager transaction not found' });
+  expect(publicHttpError(new NotFoundError('Wager transaction not found'))).toEqual({ status: 404, code: 'WALLET_NOT_FOUND', message: 'Wallet not found' });
+});
+test('CP03 invalid query path identifiers are 400 before UoW; unexpected query errors retain sanitization', async () => {
+  let calls = 0;
+  const app = await NestFactory.create(AppModule.register({ uow: { async run() { calls++; throw new Error('private credentials SQL'); } } }), { logger: false, abortOnError: false });
+  try {
+    await app.listen(0, '127.0.0.1'); const url = await app.getUrl();
+    for (const path of ['/wagering/transactions/invalid', '/wagering/transactions/%20', '/providers/%20/wagering/transactions/key',
+      '/providers/%20provider/wagering/transactions/key', '/providers/provider%20/wagering/transactions/key',
+      '/providers/provider/wagering/transactions/%20', '/providers/provider/wagering/transactions/%20key', '/providers/provider/wagering/transactions/key%20']) {
+      expect((await fetch(`${url}${path}`)).status).toBe(400);
+    }
+    expect(calls).toBe(0);
+    for (const path of [`/wagering/transactions/${valid.walletId}`, '/providers/provider-test/wagering/transactions/external-test']) {
+      const response = await fetch(`${url}${path}`);
+      expect(response.status).toBe(500); expect(await response.json()).toEqual({ code: 'INTERNAL_SERVER_ERROR', message: 'Internal server error' });
+      expect(response.headers.get('x-correlation-id')).toMatch(/^[a-f0-9-]{36}$/);
+    }
+  } finally { await app.close(); }
+});

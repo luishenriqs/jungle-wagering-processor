@@ -3,7 +3,7 @@ import { PersistenceInvariantError } from '../../../shared/application/applicati
 import { internalId } from '../../../shared/application/identifiers';
 import { requireText } from '../../../shared/domain/validation';
 import { Money } from '../../../shared/domain/money';
-import { WagerTransactionKind as Kind, WagerTransactionStatus as Status } from '../domain/wager-transaction';
+import { WagerTransactionKind as Kind, WagerTransactionStatus as Status, type WagerTransaction } from '../domain/wager-transaction';
 import type { ProcessWagerInput, ProcessWagerResult } from '../application/process-wager-transaction.use-case';
 
 export interface WagerHttpRequest {
@@ -63,4 +63,18 @@ export function wagerHttpStatus(result: ProcessWagerResult): number {
       break;
   }
   throw new PersistenceInvariantError('Unexpected processing result status');
+}
+
+export function wagerQueryText(value: unknown): string {
+  const result = text(value);
+  if (result !== result.trim()) throw new InvalidDomainInputError('Invalid external identifier');
+  return result;
+}
+export function toWagerHttpResponse(transaction: WagerTransaction) {
+  return { transactionId: transaction.id, providerId: transaction.providerId, externalTransactionId: transaction.externalTransactionId,
+    walletId: transaction.walletId, playerId: transaction.playerId, roundId: transaction.roundId, gameId: transaction.gameId,
+    kind: transaction.kind, money: transaction.money.toJSON(), status: transaction.status, createdAt: transaction.createdAt.toISOString(),
+    recordedBalance: transaction.recordedBalance?.toJSON() ?? null, referenceExternalTransactionId: transaction.referenceExternalTransactionId ?? null,
+    referenceTransactionId: transaction.referenceTransactionId ?? null, failureCode: transaction.failureCode ?? null,
+    processedAt: transaction.processedAt?.toISOString() ?? null };
 }

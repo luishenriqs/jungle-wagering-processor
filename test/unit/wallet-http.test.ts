@@ -28,7 +28,7 @@ test('HTTP foundation without database rejects financial requests with 503', asy
   }
 });
 
-import { HttpException, BadRequestException, NotFoundException } from '@nestjs/common';
+import { HttpException, BadRequestException, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { ModulesContainer } from '@nestjs/core';
 import { MikroORM as CoreORM } from '@mikro-orm/core';
 import { CreateWalletUseCase } from '../../src/modules/wallets/application/create-wallet.use-case';
@@ -123,4 +123,101 @@ test('present but invalid database configuration fails startup instead of fallin
   } finally {
     if (previous === undefined) delete process.env['DATABASE_URL']; else process.env['DATABASE_URL'] = previous;
   }
+});
+
+import { ListWalletLedgerUseCase } from '../../src/modules/wallets/application/wallet-queries';
+import type { FinancialStore } from '../../src/shared/application/financial-store';
+
+const queryWalletId = '0192f291-27dd-7d3f-8071-5f8685deef37';
+const encodeCursor = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+
+test('CP03 ledger GET exists and returns explicit empty-page contract', async () => {
+  const store = { async getWallet() { return Wallet.open({ id: queryWalletId, playerId: 'player-test', initialBalance: Money.zero('BRL'), at: new Date() }); }, async ledgerPage() { return []; } } as unknown as FinancialStore;
+  const app = await NestFactory.create(AppModule.register({ uow: { run: work => work(store) } }), { logger: false, abortOnError: false });
+  try {
+    await app.listen(0, '127.0.0.1');
+    const response = await fetch(`${await app.getUrl()}/wallets/${queryWalletId}/ledger`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ entries: [], nextCursor: null });
+  } finally { await app.close(); }
+});
+
+test('CP03 invalid cursor calendar is rejected before the application opens a UoW', async () => {
+  let calls = 0;
+  const reader = new ListWalletLedgerUseCase({ async run() { calls++; throw new InvalidDomainInputError('test persistence boundary reached'); } });
+  await expect(reader.execute({ walletId: queryWalletId, cursor: encodeCursor({ createdAt: '2026-02-30T12:00:00.123456Z', id: queryWalletId }) })).rejects.toBeInstanceOf(InvalidDomainInputError);
+  expect(calls).toBe(0);
+});
+
+test('CP03 invalid ledger query is HTTP 400 without UoW access', async () => {
+  let calls = 0;
+  const app = await NestFactory.create(AppModule.register({ uow: { async run() { calls++; throw new Error('must not query'); } } }), { logger: false, abortOnError: false });
+  try {
+    await app.listen(0, '127.0.0.1');
+    const response = await fetch(`${await app.getUrl()}/wallets/${queryWalletId}/ledger?limit=1e1`);
+    expect(response.status).toBe(400); expect(calls).toBe(0);
+  } finally { await app.close(); }
+});
+
+import { parseLedgerCursor } from '../../src/modules/wallets/application/wallet-queries';
+import { ledgerHttpQuery, toLedgerHttpResponse } from '../../src/modules/wallets/infrastructure/wallet-http.dto';
+import { WalletLedgerEntry, LedgerDirection } from '../../src/modules/wallets/domain/wallet-ledger-entry';
+
+const cursorTimestamp = '2026-11-04T12:00:00.123456Z';
+const invalidLedgerCursors: unknown[] = ['', 'a'.repeat(513), 'bad=', 'bad+', 'bad/', 'bad ', 'invalid', 1, null, [], {},
+  ...[null, [], 'text', 1, {}, { createdAt: cursorTimestamp }, { id: queryWalletId },
+    { createdAt: cursorTimestamp, id: queryWalletId, extra: true }, { createdAt: cursorTimestamp, id: 'invalid' },
+    { createdAt: cursorTimestamp, id: null }, { createdAt: 1, id: queryWalletId }].map(encodeCursor),
+  ...['2026-02-30T12:00:00.123456Z', '2026-02-29T12:00:00.123456Z', '2026-04-31T12:00:00.123456Z',
+    '0000-01-01T00:00:00.000000Z', '2026-11-04T24:00:00.000000Z', '2026-13-01T00:00:00.000000Z',
+    '2026-00-01T00:00:00.000000Z', '2026-01-00T00:00:00.000000Z', '2026-01-01T00:60:00.000000Z',
+    '2026-01-01T00:00:60.000000Z', '2026-01-01T00:00:00.123Z', '2026-01-01T00:00:00.123456+00:00',
+    '2026-01-01 00:00:00.123456Z'].map(createdAt => encodeCursor({ createdAt, id: queryWalletId }))];
+for (const [index, cursor] of invalidLedgerCursors.entries()) {
+  test(`CP03 invalid cursor ${index} is rejected at both boundaries before UoW`, async () => {
+    expect(() => ledgerHttpQuery({ cursor })).toThrow(InvalidDomainInputError);
+    let calls = 0;
+    const reader = new ListWalletLedgerUseCase({ async run() { calls++; throw new Error('must not query'); } });
+    await expect(reader.execute({ walletId: queryWalletId, cursor: cursor as string })).rejects.toBeInstanceOf(InvalidDomainInputError);
+    expect(calls).toBe(0);
+  });
+}
+for (const timestamp of ['0001-01-01T00:00:00.000001Z', '0099-12-31T23:59:59.999999Z', '2000-02-29T12:00:00.123456Z', '2024-02-29T00:00:00.000000Z', '9999-12-31T23:59:59.999999Z', cursorTimestamp]) {
+  test(`CP03 valid cursor preserves all original microseconds: ${timestamp}`, () => {
+    const cursor = encodeCursor({ createdAt: timestamp, id: queryWalletId.toUpperCase() });
+    expect(parseLedgerCursor(cursor)).toEqual({ createdAt: timestamp, id: queryWalletId });
+    expect(ledgerHttpQuery({ cursor, limit: '100' })).toEqual({ cursor, limit: 100 });
+  });
+}
+const invalidLedgerQueries: unknown[] = [null, [], 1, { unknown: '1' }, { limit: ['10', '20'] }, { limit: {} }, { cursor: ['a', 'b'] },
+  ...['0', '101', '-1', '10.0', '1e1', '0x10', '010', '', ' 10', '10 ', '+1', 'Infinity', '1'.repeat(400)].map(limit => ({ limit }))];
+for (const [index, query] of invalidLedgerQueries.entries()) {
+  test(`CP03 invalid ledger query ${index} is rejected without coercion`, () => expect(() => ledgerHttpQuery(query)).toThrow(InvalidDomainInputError));
+}
+test('CP03 ledger projection is exact, monetary strings and nextCursor null/string are preserved', () => {
+  const entry = WalletLedgerEntry.create({ id: queryWalletId, walletId: queryWalletId, transactionId: queryWalletId, direction: LedgerDirection.Debit,
+    money: Money.from({ amount: '25.00', currency: 'BRL' }), balanceBefore: Money.from({ amount: '1000.00', currency: 'BRL' }),
+    balanceAfter: Money.from({ amount: '975.00', currency: 'BRL' }), createdAt: new Date('2026-11-05T12:00:00.123Z') });
+  const expected = { id: queryWalletId, walletId: queryWalletId, transactionId: queryWalletId, direction: LedgerDirection.Debit, money: { amount: '25.00', currency: 'BRL' },
+    balanceBefore: { amount: '1000.00', currency: 'BRL' }, balanceAfter: { amount: '975.00', currency: 'BRL' }, createdAt: '2026-11-05T12:00:00.123Z' };
+  expect(toLedgerHttpResponse({ entries: [entry] })).toEqual({ entries: [expected], nextCursor: null });
+  expect(toLedgerHttpResponse({ entries: [entry], nextCursor: 'opaque' })).toEqual({ entries: [expected], nextCursor: 'opaque' });
+  expect(ledgerHttpQuery({})).toEqual({});
+});
+test('CP03 invalid ledger HTTP inputs never open UoW; unavailable persistence remains explicit 503', async () => {
+  let calls = 0;
+  const app = await NestFactory.create(AppModule.register({ uow: { async run() { calls++; throw new ServiceUnavailableException(); } } }), { logger: false, abortOnError: false });
+  try {
+    await app.listen(0, '127.0.0.1'); const base = `${await app.getUrl()}/wallets/${queryWalletId}/ledger`;
+    const queries = ['limit=0', 'limit=101', 'limit=-1', 'limit=10.0', 'limit=1e1', 'limit=0x10', 'limit=010', 'limit=',
+      'limit=%2010', 'limit=10%20', 'limit=10&limit=20', 'limit[]=10', 'limit[x]=10', 'unknown=1', 'cursor=', 'cursor=a&cursor=b'];
+    for (const cursor of invalidLedgerCursors.filter((v): v is string => typeof v === 'string')) queries.push(`cursor=${encodeURIComponent(cursor)}`);
+    for (const query of queries) {
+      const response = await fetch(`${base}?${query}`);
+      expect(response.status).toBe(400); expect(response.headers.get('x-correlation-id')).toMatch(/^[a-f0-9-]{36}$/);
+    }
+    expect((await fetch(`${await app.getUrl()}/wallets/invalid/ledger`)).status).toBe(400);
+    expect(calls).toBe(0);
+    expect((await fetch(base)).status).toBe(503); expect(calls).toBe(1);
+  } finally { await app.close(); }
 });

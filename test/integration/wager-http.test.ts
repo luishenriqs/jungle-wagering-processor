@@ -386,3 +386,132 @@ test('T21 production graph initializes one real ORM/pool, shares it with both fe
   }
   expect(await owned?.isConnected()).toBe(false); expect(await h.orm.isConnected()).toBe(true);
 });
+
+type WagerHttpQuery = { transactionId: string; providerId: string; externalTransactionId: string; walletId: string; playerId: string; roundId: string; gameId: string;
+  kind: K; money: { amount: string; currency: string }; status: S; createdAt: string; recordedBalance: { amount: string; currency: string } | null;
+  referenceExternalTransactionId: string | null; referenceTransactionId: string | null; failureCode: F | null; processedAt: string | null };
+async function wagerGet(path: string) {
+  const response = await fetch(`${await app.getUrl()}${path}`);
+  return { response, data: await response.json() as WagerHttpQuery };
+}
+async function getBoth(tx: WagerTransaction) {
+  const internal = await wagerGet(`/wagering/transactions/${tx.id.toUpperCase()}`);
+  const external = await wagerGet(`/providers/${encodeURIComponent(tx.providerId)}/wagering/transactions/${encodeURIComponent(tx.externalTransactionId)}`);
+  expect(internal.response.status).toBe(200); expect(external.response.status).toBe(200); expect(external.data).toEqual(internal.data);
+  expect(internal.response.headers.get('x-correlation-id')).toMatch(/^[a-f0-9-]{36}$/);
+  expect(external.response.headers.get('x-correlation-id')).not.toBe(internal.response.headers.get('x-correlation-id'));
+  return internal.data;
+}
+async function queryDatabaseSnapshot() {
+  const result: Record<string, unknown> = {};
+  for (const [table, order] of [['wallets', 'id'], ['wager_transactions', 'id'], ['wallet_ledger_entries', 'id'], ['inbox_messages', 'consumer_name,message_id'], ['outbox_messages', 'id']]) {
+    result[table!] = await h.orm.em.fork().execute(`select * from "${h.schema}".${table} order by ${order}`);
+  }
+  return result;
+}
+for (const state of [S.Pending, S.PendingReference, S.Processed, S.Rejected, S.Failed, 'OPENING'] as const) {
+  test(`CP03 both GETs expose exact ${state} state without financial writes`, async () => {
+    const wallet = await h.wallet(); const at = new Date('2026-11-05T12:00:00.123Z');
+    let tx: WagerTransaction;
+    if (state === 'OPENING') {
+      const rows = await h.orm.em.fork().execute<{ id: string }[]>("select id from wager_transactions where wallet_id=? and kind='OPENING'", [wallet.id]);
+      tx = (await h.uow.run(store => store.getWager(rows[0]!.id)))!;
+    } else {
+      const input = request(wallet, state === S.PendingReference ? { kind: K.Refund, referenceExternalTransactionId: 'absent-bet' }
+        : state === S.Rejected ? { money: { amount: '200.00', currency: 'BRL' } } : {});
+      if (state === S.Pending || state === S.Failed) {
+        tx = WagerTransaction.create({ ...input, id: crypto.randomUUID(), money: Money.from(input.money), payloadHash: wagerPayloadHash(input), createdAt: at });
+        if (state === S.Failed) tx.fail(F.InfrastructurePermanent, wallet.balance);
+        await h.uow.run(store => store.insertWager(tx));
+      } else {
+        const result = await new ProcessWagerTransactionUseCase(h.uow, { now: () => at }).execute(input);
+        tx = (await h.uow.run(store => store.getWager(result.transactionId)))!;
+      }
+    }
+    // Later balance must never replace the transaction's persisted acceptance/terminal snapshot.
+    await h.process.execute(request(wallet, { kind: K.Win, money: { amount: '50.00', currency: 'BRL' } }));
+    const before = await queryDatabaseSnapshot();
+    const data = await getBoth(tx);
+    expect(data).toEqual({ transactionId: tx.id, providerId: tx.providerId, externalTransactionId: tx.externalTransactionId, walletId: wallet.id,
+      playerId: wallet.playerId, roundId: tx.roundId, gameId: tx.gameId, kind: tx.kind, money: tx.money.toJSON(), status: tx.status,
+      createdAt: tx.createdAt.toISOString(), recordedBalance: tx.recordedBalance?.toJSON() ?? null,
+      referenceExternalTransactionId: state === S.PendingReference ? 'absent-bet' : null, referenceTransactionId: null,
+      failureCode: state === S.Failed ? F.InfrastructurePermanent : state === S.Rejected ? F.InsufficientFundsBet : null,
+      processedAt: tx.processedAt?.toISOString() ?? null });
+    if (state === S.Pending) expect(data.recordedBalance).toBeNull();
+    else expect(data.recordedBalance?.amount).toBe(state === S.Processed ? '90.00' : '100.00');
+    expect(await queryDatabaseSnapshot()).toEqual(before);
+  });
+}
+test('CP03 provider lookup scopes equal external IDs by provider without leaking the other transaction', async () => {
+  const wallet = await h.wallet(); const external = 'same-external-id';
+  const a = await h.process.execute(request(wallet, { providerId: 'provider-a', externalTransactionId: external, idempotencyKey: `provider-a:${external}` }));
+  const b = await h.process.execute(request(wallet, { providerId: 'provider-b', externalTransactionId: external, idempotencyKey: `provider-b:${external}`, kind: K.Win }));
+  const before = await queryDatabaseSnapshot();
+  const first = await wagerGet(`/providers/provider-a/wagering/transactions/${external}`);
+  const second = await wagerGet(`/providers/provider-b/wagering/transactions/${external}`);
+  expect(first.response.status).toBe(200); expect(second.response.status).toBe(200);
+  expect(first.data.transactionId).toBe(a.transactionId); expect(second.data.transactionId).toBe(b.transactionId);
+  expect(first.data.providerId).toBe('provider-a'); expect(second.data.providerId).toBe('provider-b');
+  expect((await wagerGet(`/providers/provider-c/wagering/transactions/${external}`)).response.status).toBe(404);
+  expect(await queryDatabaseSnapshot()).toEqual(before);
+});
+test('CP03 resolved references and currency-mismatch snapshots use persisted transaction fields', async () => {
+  const wallet = await h.wallet(); const bet = request(wallet); const processed = await h.process.execute(bet);
+  const refund = await h.process.execute(request(wallet, { kind: K.Refund, referenceExternalTransactionId: bet.externalTransactionId }));
+  const mismatch = await h.process.execute(request(wallet, { money: { amount: '1.00', currency: 'USD' } }));
+  await h.process.execute(request(wallet, { kind: K.Win, money: { amount: '25.00', currency: 'BRL' } }));
+  const before = await queryDatabaseSnapshot();
+  const returned = await getBoth((await h.uow.run(store => store.getWager(refund.transactionId)))!);
+  expect(returned.referenceExternalTransactionId).toBe(bet.externalTransactionId); expect(returned.referenceTransactionId).toBe(processed.transactionId);
+  expect(returned.recordedBalance).toEqual({ amount: '100.00', currency: 'BRL' });
+  const rejected = await getBoth((await h.uow.run(store => store.getWager(mismatch.transactionId)))!);
+  expect(rejected.status).toBe(S.Rejected); expect(rejected.failureCode).toBe(F.CurrencyMismatch);
+  expect(rejected.money).toEqual({ amount: '1.00', currency: 'USD' }); expect(rejected.recordedBalance).toEqual({ amount: '100.00', currency: 'BRL' });
+  expect(await queryDatabaseSnapshot()).toEqual(before);
+});
+test('CP03 resource-specific 404 mappings and invalid GETs preserve all five tables and the POST contract', async () => {
+  const wallet = await h.wallet(); const before = await queryDatabaseSnapshot();
+  for (const path of [`/wagering/transactions/${crypto.randomUUID()}`, '/providers/no-provider/wagering/transactions/no-transaction']) {
+    const missing = await wagerGet(path);
+    expect(missing.response.status).toBe(404); expect(missing.data as unknown).toEqual({ code: 'WAGER_NOT_FOUND', message: 'Wager transaction not found' });
+  }
+  const missingWallet = await fetch(`${await app.getUrl()}/wallets/${crypto.randomUUID()}`);
+  expect(missingWallet.status).toBe(404); expect(await missingWallet.json()).toEqual({ code: 'WALLET_NOT_FOUND', message: 'Wallet not found' });
+  const missingPost = await post(request(wallet, { walletId: crypto.randomUUID() }));
+  expect(missingPost.response.status).toBe(404); expect(missingPost.result as unknown).toEqual({ code: 'WALLET_NOT_FOUND', message: 'Wallet not found' });
+  for (const path of ['/wagering/transactions/invalid', '/providers/%20/wagering/transactions/key', '/providers/provider/wagering/transactions/key%20']) {
+    expect((await wagerGet(path)).response.status).toBe(400);
+  }
+  expect(await queryDatabaseSnapshot()).toEqual(before);
+});
+test('CP03 GETs do not wait on a financial row lock and observe only committed state during processing', async () => {
+  const wallet = await h.wallet(); const earlier = await h.process.execute(request(wallet));
+  const input = request(wallet); let release!: () => void; let ready!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }); const locked = new Promise<void>(resolve => { ready = resolve; });
+  let nextId = crypto.randomUUID(); const pendingId = nextId;
+  const processor = new ProcessWagerTransactionUseCase(h.uow, { newId: () => { const id = nextId; nextId = crypto.randomUUID(); return id; },
+    checkpoint: async phase => { if (phase === 'beforeCommit') { ready(); await gate; } } });
+  const write = processor.execute(input);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([locked, write.then(() => { throw new Error('Expected paused financial transaction'); })]);
+    const before = await queryDatabaseSnapshot();
+    const reads = Promise.all([
+      wagerGet(`/wagering/transactions/${earlier.transactionId}`), wagerGet(`/wagering/transactions/${pendingId}`),
+      wagerGet(`/providers/${input.providerId}/wagering/transactions/${input.externalTransactionId}`),
+      fetch(`${await app.getUrl()}/wallets/${wallet.id}/ledger`).then(async response => ({ status: response.status, data: await response.json() })),
+    ]);
+    const observed = await Promise.race([reads, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('GET waited for a financial write lock')), 1500); })]);
+    expect((observed[0] as Awaited<ReturnType<typeof wagerGet>>).response.status).toBe(200);
+    expect((observed[0] as Awaited<ReturnType<typeof wagerGet>>).data.recordedBalance).toEqual({ amount: '90.00', currency: 'BRL' });
+    expect((observed[1] as Awaited<ReturnType<typeof wagerGet>>).response.status).toBe(404);
+    expect((observed[2] as Awaited<ReturnType<typeof wagerGet>>).response.status).toBe(404);
+    expect(observed[3]).toMatchObject({ status: 200 });
+    expect(await queryDatabaseSnapshot()).toEqual(before);
+  } finally { if (timeout) clearTimeout(timeout); release(); await write; }
+  const after = await queryDatabaseSnapshot();
+  const committed = await wagerGet(`/wagering/transactions/${pendingId}`);
+  expect(committed.response.status).toBe(200); expect(committed.data.recordedBalance).toEqual({ amount: '80.00', currency: 'BRL' });
+  expect(await queryDatabaseSnapshot()).toEqual(after);
+});

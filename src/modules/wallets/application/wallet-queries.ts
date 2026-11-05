@@ -10,24 +10,30 @@ export class GetWalletUseCase {
     return this.uow.run(async store => { const wallet = await store.getWallet(internalId(id)); if (!wallet) throw new NotFoundError('Wallet not found'); return wallet; });
   }
 }
+/** Decode opaque cursor without losing the PostgreSQL microsecond precision. */
+export function parseLedgerCursor(value: unknown): LedgerPosition {
+  try {
+    if (typeof value !== 'string' || value.length < 1 || value.length > 512 || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error();
+    const parsed: unknown = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) throw new Error();
+    const cursor = parsed as Record<string, unknown>;
+    if (Object.keys(cursor).length !== 2 || !Object.hasOwn(cursor, 'createdAt') || !Object.hasOwn(cursor, 'id')) throw new Error();
+    const timestamp = cursor['createdAt'];
+    if (typeof timestamp !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(timestamp) || timestamp.startsWith('0000-')) throw new Error();
+    // Date validates the calendar at milliseconds; return the original six-digit timestamp.
+    const milliseconds = `${timestamp.slice(0, 23)}Z`;
+    const calendar = new Date(milliseconds);
+    if (!Number.isFinite(calendar.getTime()) || calendar.toISOString() !== milliseconds || typeof cursor['id'] !== 'string') throw new Error();
+    return { createdAt: timestamp, id: internalId(cursor['id']) };
+  } catch { throw new InvalidDomainInputError('Invalid ledger cursor'); }
+}
 export class ListWalletLedgerUseCase {
   constructor(private readonly uow: FinancialUnitOfWork) {}
   async execute(input: { walletId: string; limit?: number; cursor?: string }) {
     const id = internalId(input.walletId);
     const limit = input.limit ?? 50;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new InvalidDomainInputError('limit must be 1..100');
-    let before: LedgerPosition | undefined;
-    if (input.cursor !== undefined) {
-      try {
-        if (input.cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(input.cursor)) throw new Error();
-        const parsed: unknown = JSON.parse(Buffer.from(input.cursor, 'base64url').toString('utf8'));
-        if (!parsed || typeof parsed !== 'object') throw new Error();
-        const cursor = parsed as Record<string, unknown>;
-        if (typeof cursor['createdAt'] !== 'string' || typeof cursor['id'] !== 'string'
-          || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(cursor['createdAt']) || !Number.isFinite(Date.parse(cursor['createdAt']))) throw new Error();
-        before = { createdAt: cursor['createdAt'], id: internalId(cursor['id']) };
-      } catch { throw new InvalidDomainInputError('Invalid ledger cursor'); }
-    }
+    const before = input.cursor === undefined ? undefined : parseLedgerCursor(input.cursor);
     return this.uow.run(async store => {
       if (!await store.getWallet(id)) throw new NotFoundError('Wallet not found');
       const rows = await store.ledgerPage(id, limit + 1, before);

@@ -1,4 +1,5 @@
 export class NotFoundError extends Error { override name = 'NotFoundError'; }
+export class WagerNotFoundError extends NotFoundError { override name = 'WagerNotFoundError'; }
 export class ConflictError extends Error { override name = 'ConflictError'; }
 export class RetryExhaustedError extends Error { override name = 'RetryExhaustedError'; }
 export class PersistenceInvariantError extends Error { override name = 'PersistenceInvariantError'; }

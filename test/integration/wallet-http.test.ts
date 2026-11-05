@@ -198,3 +198,99 @@ test('production HTTP composition initializes exactly one ORM and pool at contex
   expect(await owned?.isConnected()).toBe(false);
   expect(await h.orm.isConnected()).toBe(true);
 });
+
+import { ProcessWagerTransactionUseCase } from '../../src/modules/wagering/application/process-wager-transaction.use-case';
+import { WagerTransactionKind as K } from '../../src/modules/wagering/domain/wager-transaction';
+import { request } from '../support/postgres';
+import { ListWalletLedgerUseCase } from '../../src/modules/wallets/application/wallet-queries';
+
+type LedgerHttpPage = { entries: { id: string; walletId: string; transactionId: string; direction: string; money: { amount: string; currency: string };
+  balanceBefore: { amount: string; currency: string }; balanceAfter: { amount: string; currency: string }; createdAt: string }[]; nextCursor: string | null };
+async function ledgerGet(walletId: string, query = '') {
+  const response = await fetch(`${url}/wallets/${walletId}/ledger${query}`);
+  return { response, page: await response.json() as LedgerHttpPage };
+}
+async function ledgerDatabaseSnapshot() {
+  const result: Record<string, unknown> = {};
+  for (const [table, order] of [['wallets', 'id'], ['wager_transactions', 'id'], ['wallet_ledger_entries', 'id'], ['inbox_messages', 'consumer_name,message_id'], ['outbox_messages', 'id']]) {
+    result[table!] = await h.orm.em.fork().execute(`select * from "${h.schema}".${table} order by ${order}`);
+  }
+  return result;
+}
+test('CP03 ledger empty/single pages have exact contracts and GET leaves all five tables unchanged', async () => {
+  const empty = await h.wallet('0.00'); const wallet = await h.wallet('1000.00');
+  const before = await ledgerDatabaseSnapshot();
+  const zero = await ledgerGet(empty.id);
+  expect(zero.response.status).toBe(200); expect(zero.page).toEqual({ entries: [], nextCursor: null });
+  const { response, page } = await ledgerGet(wallet.id.toUpperCase(), '?limit=1');
+  expect(response.status).toBe(200); expect(response.headers.get('x-correlation-id')).toMatch(/^[a-f0-9-]{36}$/);
+  const rows = await h.orm.em.fork().execute<{ id: string; transaction_id: string }[]>('select id,transaction_id from wallet_ledger_entries where wallet_id=?', [wallet.id]);
+  expect(page).toEqual({ entries: [{ id: rows[0]!.id, walletId: wallet.id, transactionId: rows[0]!.transaction_id, direction: 'CREDIT',
+    money: { amount: '1000.00', currency: 'BRL' }, balanceBefore: { amount: '0.00', currency: 'BRL' }, balanceAfter: { amount: '1000.00', currency: 'BRL' }, createdAt: wallet.createdAt.toISOString() }], nextCursor: null });
+  const missing = await ledgerGet(crypto.randomUUID());
+  expect(missing.response.status).toBe(404); expect(missing.page as unknown).toEqual({ code: 'WALLET_NOT_FOUND', message: 'Wallet not found' });
+  expect(await ledgerDatabaseSnapshot()).toEqual(before);
+});
+test('CP03 ledger paginates 121 identical timestamps as 50+50+21 with exact descending order and wallet isolation', async () => {
+  const wallet = await h.wallet('0.00'); const other = await h.wallet();
+  const fixed = new Date('2026-11-04T12:00:00.123Z');
+  const process = new ProcessWagerTransactionUseCase(h.uow, { now: () => fixed });
+  for (let index = 0; index < 121; index++) await process.execute(request(wallet, { kind: K.Win, money: { amount: '1.00', currency: 'BRL' } }));
+  const expected = await h.orm.em.fork().execute<{ id: string }[]>('select id from wallet_ledger_entries where wallet_id=? order by created_at desc,id desc', [wallet.id]);
+  const before = await ledgerDatabaseSnapshot();
+  const ids: string[] = []; const lengths: number[] = []; let cursor: string | null = null;
+  do {
+    const result = await ledgerGet(wallet.id, cursor ? `?cursor=${cursor}` : '');
+    expect(result.response.status).toBe(200); lengths.push(result.page.entries.length);
+    expect(result.page.entries.every(entry => entry.walletId === wallet.id)).toBe(true);
+    ids.push(...result.page.entries.map(entry => entry.id)); cursor = result.page.nextCursor;
+    if (cursor) {
+      const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+      expect(decoded).toEqual({ createdAt: '2026-11-04T12:00:00.123000Z', id: result.page.entries.at(-1)!.id });
+    }
+  } while (cursor);
+  expect(lengths).toEqual([50, 50, 21]); expect(ids).toEqual(expected.map(row => row.id)); expect(new Set(ids).size).toBe(121);
+  expect((await ledgerGet(wallet.id, '?limit=100')).page.entries).toHaveLength(100);
+  expect((await ledgerGet(other.id)).page.entries).toHaveLength(1);
+  expect(await ledgerDatabaseSnapshot()).toEqual(before);
+}, 15000);
+test('CP03 distinct microseconds in one millisecond survive cursor boundaries without omission', async () => {
+  const wallet = await h.wallet('0.00');
+  // Adapt only the timestamp at INSERT in this disposable fixture. No ledger UPDATE or disabled constraint.
+  let inserted = 0;
+  const fixture: FinancialUnitOfWork = { run: work => h.uow.run(store => work(new Proxy(store, {
+    get(target, key) {
+      if (key === 'appendLedger') return async (entry: import('../../src/modules/wallets/domain/wallet-ledger-entry').WalletLedgerEntry) => {
+        const timestamp = `2026-11-04T12:00:00.123${['001', '999', '500'][inserted++]}Z`;
+        // Use the same transactional EM as the real store, preserving deferred consistency checks.
+        const em = Reflect.get(target, 'em') as import('@mikro-orm/postgresql').EntityManager;
+        await em.execute(`insert into wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount,currency,balance_before,balance_after,created_at)
+          values(?,?,?,?,?,?,?,?,?::timestamptz)`, [entry.id, entry.walletId, entry.transactionId, entry.direction, entry.money.toString(), entry.money.currency,
+          entry.balanceBefore.toString(), entry.balanceAfter.toString(), timestamp]);
+      };
+      const value: unknown = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as FinancialStore)) };
+  const process = new ProcessWagerTransactionUseCase(fixture);
+  for (let n = 0; n < 3; n++) await process.execute(request(wallet, { kind: K.Win, money: { amount: '1.00', currency: 'BRL' } }));
+  const expected = await h.orm.em.fork().execute<{ id: string }[]>('select id from wallet_ledger_entries where wallet_id=? order by created_at desc,id desc', [wallet.id]);
+  const before = await ledgerDatabaseSnapshot(); const ids: string[] = []; const positions: string[] = []; let cursor: string | null = null;
+  do {
+    const result = await ledgerGet(wallet.id, `?limit=1${cursor ? `&cursor=${cursor}` : ''}`);
+    expect(result.response.status).toBe(200); expect(result.page.entries).toHaveLength(1);
+    ids.push(result.page.entries[0]!.id); expect(result.page.entries[0]!.createdAt).toBe('2026-11-04T12:00:00.123Z');
+    cursor = result.page.nextCursor; if (cursor) positions.push(JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')).createdAt);
+  } while (cursor);
+  expect(positions).toEqual(['2026-11-04T12:00:00.123999Z', '2026-11-04T12:00:00.123500Z']);
+  expect(ids).toEqual(expected.map(row => row.id)); expect(new Set(ids).size).toBe(3);
+  expect(await ledgerDatabaseSnapshot()).toEqual(before); expect((await h.reconcile.execute(wallet.id)).consistent).toBe(true);
+});
+test('CP03 invalid ledger HTTP queries are 400 and preserve every persisted table', async () => {
+  const wallet = await h.wallet(); const before = await ledgerDatabaseSnapshot();
+  const badCursor = Buffer.from(JSON.stringify({ createdAt: '2026-02-30T12:00:00.123456Z', id: wallet.id })).toString('base64url');
+  for (const query of ['limit=0', 'limit=101', 'limit=-1', 'limit=10.0', 'limit=1e1', 'limit=0x10', 'limit=010', 'limit=',
+    'limit=10&limit=20', 'limit[]=10', 'unknown=1', 'cursor=', 'cursor=a&cursor=b', `cursor=${badCursor}`]) {
+    expect((await ledgerGet(wallet.id, `?${query}`)).response.status).toBe(400);
+  }
+  expect((await ledgerGet('invalid')).response.status).toBe(400); expect(await ledgerDatabaseSnapshot()).toEqual(before);
+});

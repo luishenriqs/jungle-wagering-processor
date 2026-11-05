@@ -1,5 +1,5 @@
 import { Catch, HttpException, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common';
-import { ConflictError, NotFoundError, PersistenceInvariantError, RetryExhaustedError, sqlError } from '../application/application-errors';
+import { ConflictError, NotFoundError, PersistenceInvariantError, RetryExhaustedError, WagerNotFoundError, sqlError } from '../application/application-errors';
 import { isTransient } from '../application/execution';
 import { CurrencyMismatchError, IdempotencyConflictError, InvalidDomainInputError, InvalidMoneyError, MoneyOverflowError } from '../domain/domain-errors';
 
@@ -18,6 +18,7 @@ export function publicHttpError(error: unknown): { status: number; code: string;
   if (error instanceof InvalidMoneyError) return { status: 400, code: 'INVALID_MONEY', message: 'Invalid money' };
   if (error instanceof MoneyOverflowError) return { status: 400, code: 'MONEY_OVERFLOW', message: 'Money exceeds supported range' };
   if (error instanceof CurrencyMismatchError) return { status: 400, code: 'CURRENCY_MISMATCH', message: 'Currencies must match' };
+  if (error instanceof WagerNotFoundError) return { status: 404, code: 'WAGER_NOT_FOUND', message: 'Wager transaction not found' };
   if (error instanceof NotFoundError) return { status: 404, code: 'WALLET_NOT_FOUND', message: 'Wallet not found' };
   if (error instanceof ConflictError) return { status: 409, code: 'WALLET_ALREADY_EXISTS', message: 'Wallet already exists for player and currency' };
   if (error instanceof IdempotencyConflictError) return { status: 409, code: 'IDEMPOTENCY_CONFLICT', message: 'Idempotency conflict' };
