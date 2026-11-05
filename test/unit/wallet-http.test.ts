@@ -42,6 +42,55 @@ import { CurrencyMismatchError, IdempotencyConflictError, InvalidDomainInputErro
 import type { FinancialUnitOfWork } from '../../src/shared/application/financial-store';
 import { Wallet } from '../../src/modules/wallets/domain/wallet';
 import { Money } from '../../src/shared/domain/money';
+import { ReconcileWalletUseCase } from '../../src/modules/wallets/application/wallet-queries';
+
+function reconciliationFixture(stored: string, amount: string, count = 1) {
+  const wallet = Wallet.rehydrate({ id: crypto.randomUUID(), playerId: 'reconciliation-test', currency: 'BRL', balance: Money.from({ amount: stored, currency: 'BRL' }), version: 1, createdAt: new Date(), updatedAt: new Date() });
+  let calls = 0;
+  const uow: FinancialUnitOfWork = { async run(work, isolation) {
+    calls++; expect(isolation).toBe('repeatable read');
+    return work({ getWallet: async () => wallet, ledgerTotal: async () => ({ amount, count }) } as unknown as FinancialStore);
+  } };
+  return { wallet, uow, calls: () => calls, reconcile: new ReconcileWalletUseCase(uow) };
+}
+test('CP04 RED-01 reconciliation endpoint returns 200', async () => {
+  const f = reconciliationFixture('0.00', '0.00', 0);
+  const application = await NestFactory.create(AppModule.register({ uow: f.uow }), { logger: false, abortOnError: false });
+  try {
+    await application.listen(0, '127.0.0.1');
+    const response = await fetch(`${await application.getUrl()}/wallets/${f.wallet.id}/reconciliation`, { method: 'POST' });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ walletId: f.wallet.id, storedBalance: { amount: '0.00', currency: 'BRL' }, calculatedBalance: { amount: '0.00', currency: 'BRL' }, difference: { amount: '0.00', currency: 'BRL' }, consistent: true, checkedEntries: 0 });
+  } finally { await application.close(); }
+});
+test('CP04 RED-02 negative aggregate produces signed diagnosis', async () => {
+  const f = reconciliationFixture('0.00', '-25.00');
+  const log = spyOn(console, 'warn').mockImplementation(() => {});
+  try { const r = await f.reconcile.execute(f.wallet.id); expect(r.calculatedBalance.amount).toBe('-25.00'); expect(r.difference.amount).toBe('25.00'); expect(r.consistent).toBe(false); }
+  finally { log.mockRestore(); }
+});
+test('CP04 RED-03 internal money overflow is an invariant and HTTP 500', async () => {
+  const f = reconciliationFixture('0.00', '10000000000000000.00');
+  let failure: unknown;
+  try { await f.reconcile.execute(f.wallet.id); } catch (error) { failure = error; }
+  expect(publicHttpError(failure).status).toBe(500);
+  expect(failure).toBeInstanceOf(PersistenceInvariantError);
+});
+test('CP04 RED-04 divergence metric is readable and log is correlated', async () => {
+  const f = reconciliationFixture('100.00', '95.00'); const correlationId = crypto.randomUUID();
+  const log = spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    expect(Reflect.get(f.reconcile, 'divergenceObservations')).toBe(0n);
+    await Reflect.apply(f.reconcile.execute, f.reconcile, [f.wallet.id, { correlationId }]);
+    expect(Reflect.get(f.reconcile, 'divergenceObservations')).toBe(1n);
+    expect(JSON.parse(log.mock.calls[0]![0] as string)).toEqual({ event: 'WalletReconciliationMismatch', walletId: f.wallet.id, correlationId });
+  } finally { log.mockRestore(); }
+});
+test('CP04 RED-05 invalid UUID never opens UoW', async () => {
+  const f = reconciliationFixture('0.00', '0.00');
+  await expect(f.reconcile.execute('invalid')).rejects.toBeInstanceOf(InvalidDomainInputError);
+  expect(f.calls()).toBe(0);
+});
 
 const valid = { playerId: 'player-test-01', initialBalance: { amount: '1000.00', currency: 'BRL' } };
 export const invalidBodies: unknown[] = [null, [], 'text', 1, {}, { ...valid, playerId: null }, { ...valid, playerId: 1 },
@@ -220,4 +269,83 @@ test('CP03 invalid ledger HTTP inputs never open UoW; unavailable persistence re
     expect(calls).toBe(0);
     expect((await fetch(base)).status).toBe(503); expect(calls).toBe(1);
   } finally { await app.close(); }
+});
+
+for (const [stored, aggregate, count, difference, consistent] of [
+  ['0.00', '0.00', 0, '0.00', true], ['100.00', '100.00', 1, '0.00', true],
+  ['75.30', '75.30', 3, '0.00', true], ['100.00', '95.00', 2, '5.00', false],
+  ['95.00', '100.00', 2, '-5.00', false], ['0.00', '-25.00', 1, '25.00', false],
+  ['0.30', '0.10', 2, '0.20', false],
+] as const) {
+  test(`CP04 reconciliation exact calculation ${stored}/${aggregate}/${count}`, async () => {
+    const f = reconciliationFixture(stored, aggregate, count); const events: unknown[] = []; const totals: bigint[] = [];
+    const reconcile = new ReconcileWalletUseCase(f.uow, { log: event => { events.push(event); }, metric: total => { totals.push(total); } });
+    expect(await reconcile.execute(f.wallet.id)).toEqual({ walletId: f.wallet.id, storedBalance: { amount: stored, currency: 'BRL' },
+      calculatedBalance: { amount: aggregate, currency: 'BRL' }, difference: { amount: difference, currency: 'BRL' }, consistent, checkedEntries: count });
+    expect(events).toHaveLength(consistent ? 0 : 1); expect(totals).toEqual(consistent ? [] : [1n]);
+    expect(reconcile.divergenceObservations).toBe(consistent ? 0n : 1n);
+  });
+}
+for (const amount of ['bad', '-0.00', '00.00', '-01.00', '1e2', 'NaN', 'Infinity', '1.001', ' 1.00', '10000000000000000.00', '-10000000000000000.00']) {
+  test(`CP04 internal invalid money is sanitized invariant: ${amount}`, async () => {
+    const f = reconciliationFixture('0.00', amount); let failure: unknown;
+    try { await f.reconcile.execute(f.wallet.id); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(PersistenceInvariantError);
+    expect(publicHttpError(failure)).toEqual({ status: 500, code: 'INTERNAL_SERVER_ERROR', message: 'Internal server error' });
+    expect(f.reconcile.divergenceObservations).toBe(0n);
+  });
+}
+test('CP04 difference overflow and internal currency mismatch become invariants', async () => {
+  const f = reconciliationFixture('9999999999999999.99', '-0.01');
+  await expect(f.reconcile.execute(f.wallet.id)).rejects.toBeInstanceOf(PersistenceInvariantError);
+  const subtract = spyOn(Money.prototype, 'subtract').mockImplementation(() => { throw new CurrencyMismatchError('internal'); });
+  try { const g = reconciliationFixture('0.00', '0.00'); await expect(g.reconcile.execute(g.wallet.id)).rejects.toBeInstanceOf(PersistenceInvariantError); }
+  finally { subtract.mockRestore(); }
+});
+test('CP04 repeated observations are monotonic; logger and metric failures are independent', async () => {
+  const f = reconciliationFixture('100.00', '95.00'); const correlationId = crypto.randomUUID();
+  const totals: bigint[] = []; const events: unknown[] = [];
+  const reconcile = new ReconcileWalletUseCase(f.uow, {
+    metric: total => { totals.push(total); throw new Error('metric unavailable'); },
+    log: event => { events.push(event); throw new Error('logger unavailable'); },
+  });
+  for (let i = 0; i < 3; i++) expect((await reconcile.execute(f.wallet.id, { correlationId })).consistent).toBe(false);
+  expect(totals).toEqual([1n, 2n, 3n]); expect(reconcile.divergenceObservations).toBe(3n);
+  expect(events).toEqual(Array.from({ length: 3 }, () => ({ event: 'WalletReconciliationMismatch', walletId: f.wallet.id, correlationId })));
+});
+test('CP04 operational effects happen after UoW completion, never on failed commit', async () => {
+  const f = reconciliationFixture('100.00', '95.00'); let completed = false; let logged = 0;
+  const completedUow: FinancialUnitOfWork = { async run(work, isolation) { const value = await f.uow.run(work, isolation); completed = true; return value; } };
+  const reconcile = new ReconcileWalletUseCase(completedUow, { log: () => { expect(completed).toBe(true); logged++; }, metric: () => { expect(completed).toBe(true); } });
+  await reconcile.execute(f.wallet.id); expect(logged).toBe(1);
+  const failure = Object.assign(new Error('commit failed'), { code: '40001' });
+  const failed = new ReconcileWalletUseCase({ async run(work, isolation) { await f.uow.run(work, isolation); throw failure; } }, { log: () => { logged++; } });
+  await expect(failed.execute(f.wallet.id)).rejects.toBe(failure); expect(failed.divergenceObservations).toBe(0n); expect(logged).toBe(1);
+  expect(publicHttpError(failure).status).toBe(503);
+});
+test('CP04 missing wallet and unexpected persistence failures retain original mapping', async () => {
+  const missing: FinancialUnitOfWork = { async run(work) { return work({ getWallet: async () => undefined } as unknown as FinancialStore); } };
+  await expect(new ReconcileWalletUseCase(missing).execute(crypto.randomUUID())).rejects.toBeInstanceOf(NotFoundError);
+  const failure = new Error('unexpected');
+  await expect(new ReconcileWalletUseCase({ async run() { throw failure; } }).execute(crypto.randomUUID())).rejects.toBe(failure);
+});
+test('CP04 HTTP strict body/query validation precedes UoW and existing errors remain sanitized', async () => {
+  let calls = 0; let failure: unknown = new NotFoundError('sensitive');
+  const application = await NestFactory.create(AppModule.register({ uow: { async run() { calls++; throw failure; } } }), { logger: false, abortOnError: false });
+  try {
+    await application.listen(0, '127.0.0.1'); const base = `${await application.getUrl()}/wallets/${crypto.randomUUID()}/reconciliation`;
+    const post = (body?: string, query = '') => fetch(base + query, { method: 'POST', headers: { 'content-type': 'application/json' }, ...(body === undefined ? {} : { body }) });
+    for (const body of ['null', '[]', '1', 'true', '"text"', '{"extra":true}', '{']) expect((await post(body)).status).toBe(400);
+    for (const query of ['?limit=1', '?x=', '?x=1&x=2', '?x[]=1']) expect((await post(undefined, query)).status).toBe(400);
+    expect((await fetch(base.replace(/wallets\/[^/]+/, 'wallets/invalid'), { method: 'POST' })).status).toBe(400);
+    expect(calls).toBe(0);
+    for (const [error, status, code] of [[new NotFoundError('secret'), 404, 'WALLET_NOT_FOUND'], [new PersistenceInvariantError('secret'), 500, 'INTERNAL_SERVER_ERROR'], [Object.assign(new Error('secret'), { code: '08006' }), 503, 'SERVICE_UNAVAILABLE'], [new Error('secret'), 500, 'INTERNAL_SERVER_ERROR']] as const) {
+      failure = error;
+      for (const body of [undefined, '{}']) {
+        const response = await post(body); expect(response.status).toBe(status); expect((await response.json() as { code: string }).code).toBe(code);
+        expect(response.headers.get('x-correlation-id')).toMatch(/^[a-f0-9-]{36}$/);
+      }
+    }
+    expect(calls).toBe(8);
+  } finally { await application.close(); }
 });

@@ -42,3 +42,9 @@ export function toLedgerHttpResponse(page: { entries: WalletLedgerEntry[]; nextC
     direction: entry.direction, money: entry.money.toJSON(), balanceBefore: entry.balanceBefore.toJSON(),
     balanceAfter: entry.balanceAfter.toJSON(), createdAt: entry.createdAt.toISOString() })), nextCursor: page.nextCursor ?? null };
 }
+
+/** Reconciliation accepts no financial input or query parameters. */
+export function reconciliationHttpInput(body: unknown, query: unknown): void {
+  if (body !== undefined) object(body, []);
+  object(query, []);
+}

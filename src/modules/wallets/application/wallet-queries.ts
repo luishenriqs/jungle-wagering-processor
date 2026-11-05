@@ -1,7 +1,7 @@
 import type { FinancialUnitOfWork, LedgerPosition } from '../../../shared/application/financial-store';
-import { NotFoundError } from '../../../shared/application/application-errors';
+import { NotFoundError, PersistenceInvariantError } from '../../../shared/application/application-errors';
 import { internalId } from '../../../shared/application/identifiers';
-import { InvalidDomainInputError } from '../../../shared/domain/domain-errors';
+import { CurrencyMismatchError, InvalidDomainInputError, InvalidMoneyError, MoneyOverflowError } from '../../../shared/domain/domain-errors';
 import { Money } from '../../../shared/domain/money';
 
 export class GetWalletUseCase {
@@ -43,18 +43,50 @@ export class ListWalletLedgerUseCase {
     });
   }
 }
+/** Operational observations are per instance/process, not distinct financial incidents. */
 export class ReconcileWalletUseCase {
-  constructor(private readonly uow: FinancialUnitOfWork) {}
-  async execute(id: string) {
-    return this.uow.run(async store => {
-      const wallet = await store.getWallet(internalId(id));
+  #divergenceObservations = 0n;
+  constructor(private readonly uow: FinancialUnitOfWork, private readonly telemetry: {
+    log?: (event: { event: 'WalletReconciliationMismatch'; walletId: string; correlationId?: string }) => void;
+    metric?: (total: bigint) => void;
+  } = {}) {}
+  /** Monotonic total available to a future metrics collector without wallet labels. */
+  get divergenceObservations(): bigint { return this.#divergenceObservations; }
+  async execute(id: string, context?: { correlationId: string }) {
+    const walletId = internalId(id);
+    const result = await this.uow.run(async store => {
+      const wallet = await store.getWallet(walletId);
       if (!wallet) throw new NotFoundError('Wallet not found');
       const aggregate = await store.ledgerTotal(wallet.id);
-      const calculated = Money.from({ amount: aggregate.amount, currency: wallet.currency });
-      const difference = wallet.balance.subtract(calculated);
-      const consistent = difference.isZero();
-      if (!consistent) console.warn(JSON.stringify({ event: 'WalletReconciliationMismatch', walletId: wallet.id }));
-      return { walletId: wallet.id, storedBalance: wallet.balance.toJSON(), calculatedBalance: calculated.toJSON(), difference: difference.toJSON(), consistent, checkedEntries: aggregate.count };
+      let calculated: Money;
+      let difference: Money;
+      try {
+        const amount = aggregate.amount;
+        if (typeof amount !== 'string' || !/^-?(0|[1-9]\d*)\.\d{2}$/.test(amount) || amount === '-0.00') {
+          throw new InvalidMoneyError('Invalid internal aggregate');
+        }
+        const negative = amount.startsWith('-');
+        const magnitude = Money.from({ amount: negative ? amount.slice(1) : amount, currency: wallet.currency });
+        calculated = negative ? magnitude.negate() : magnitude;
+        difference = wallet.balance.subtract(calculated);
+      } catch (error) {
+        if (error instanceof InvalidMoneyError || error instanceof MoneyOverflowError || error instanceof CurrencyMismatchError) {
+          throw new PersistenceInvariantError('Invalid reconciliation money', { cause: error });
+        }
+        throw error;
+      }
+      return { walletId: wallet.id, storedBalance: wallet.balance.toJSON(), calculatedBalance: calculated.toJSON(), difference: difference.toJSON(), consistent: difference.isZero(), checkedEntries: aggregate.count };
     }, 'repeatable read');
+    // Observe only after the UoW completes; telemetry never retries or replaces a diagnosis.
+    if (!result.consistent) {
+      const total = ++this.#divergenceObservations;
+      try { this.telemetry.metric?.(total); } catch { /* Collection failure cannot invalidate financial reads. */ }
+      try {
+        const event = { event: 'WalletReconciliationMismatch' as const, walletId: result.walletId,
+          ...(context ? { correlationId: context.correlationId } : {}) };
+        if (this.telemetry.log) this.telemetry.log(event); else console.warn(JSON.stringify(event));
+      } catch { /* Logging failure cannot invalidate financial reads. */ }
+    }
+    return result;
   }
 }

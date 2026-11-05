@@ -294,3 +294,136 @@ test('CP03 invalid ledger HTTP queries are 400 and preserve every persisted tabl
   }
   expect((await ledgerGet('invalid')).response.status).toBe(400); expect(await ledgerDatabaseSnapshot()).toEqual(before);
 });
+
+import { ReconcileWalletUseCase } from '../../src/modules/wallets/application/wallet-queries';
+import { PostgresFinancialStore } from '../../src/database/postgres-financial-store';
+import { IsolationLevel } from '@mikro-orm/core';
+import { sqlError } from '../../src/shared/application/application-errors';
+
+async function reconciliationPost(walletId: string, base = url, body?: string) {
+  return fetch(`${base}/wallets/${walletId}/reconciliation`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    ...(body === undefined ? {} : { body }) });
+}
+async function reconciliationSnapshot(em: import('@mikro-orm/postgresql').EntityManager) {
+  const result: Record<string, unknown> = {};
+  for (const [table, order] of [['wallets', 'id'], ['wager_transactions', 'id'], ['wallet_ledger_entries', 'id'], ['inbox_messages', 'consumer_name,message_id'], ['outbox_messages', 'id']]) {
+    result[table!] = await em.execute(`select * from "${h.schema}".${table} order by ${order}`);
+  }
+  return result;
+}
+test('CP04 real reconciliation covers empty/opening/credits/debits and preserves all five tables', async () => {
+  const zero = await h.wallet('0.00'); const wallet = await h.wallet('100.00');
+  const metricBefore = app.get(ReconcileWalletUseCase).divergenceObservations;
+  const before = await ledgerDatabaseSnapshot();
+  for (const [w, balance, checkedEntries, body] of [[zero, '0.00', 0, undefined], [wallet, '100.00', 1, '{}']] as const) {
+    const response = await reconciliationPost(w.id, url, body); expect(response.status).toBe(200);
+    expect(response.headers.get('x-correlation-id')).toMatch(/^[a-f0-9-]{36}$/);
+    expect(await response.json()).toEqual({ walletId: w.id, storedBalance: { amount: balance, currency: 'BRL' }, calculatedBalance: { amount: balance, currency: 'BRL' }, difference: { amount: '0.00', currency: 'BRL' }, consistent: true, checkedEntries });
+  }
+  expect(await ledgerDatabaseSnapshot()).toEqual(before);
+  await h.process.execute(request(wallet, { money: { amount: '25.10', currency: 'BRL' } }));
+  await h.process.execute(request(wallet, { kind: K.Win, money: { amount: '0.30', currency: 'BRL' } }));
+  const moved = await ledgerDatabaseSnapshot();
+  const response = await reconciliationPost(wallet.id); expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ walletId: wallet.id, storedBalance: { amount: '75.20', currency: 'BRL' }, calculatedBalance: { amount: '75.20', currency: 'BRL' }, difference: { amount: '0.00', currency: 'BRL' }, consistent: true, checkedEntries: 3 });
+  expect(await ledgerDatabaseSnapshot()).toEqual(moved);
+  expect(app.get(ReconcileWalletUseCase).divergenceObservations).toBe(metricBefore);
+  const missing = await reconciliationPost(crypto.randomUUID()); expect(missing.status).toBe(404);
+  expect(await missing.json()).toEqual({ code: 'WALLET_NOT_FOUND', message: 'Wallet not found' });
+});
+
+for (const mode of ['stored-above', 'stored-below', 'negative-total'] as const) {
+  test(`CP04 VAL02-01 real SQL ${mode}; HTTP is controlled replay after rejected fixture commit`, async () => {
+    const negative = mode === 'negative-total'; const wallet = await h.wallet(negative ? '0.00' : '100.00');
+    const before = await ledgerDatabaseSnapshot(); let rejectedCommits = 0; let captured = 0;
+    // Controlled simulation: execute real reconciliation SQL against our own temporary
+    // fixture, capture its diagnosis, then return that diagnosis only AFTER PostgreSQL
+    // rejects the inconsistent commit and rolls back. This is not committed corruption.
+    const fixture: FinancialUnitOfWork = { async run<T>(work: (store: FinancialStore) => Promise<T>, isolation?: 'read committed' | 'repeatable read'): Promise<T> {
+      expect(isolation).toBe('repeatable read'); let diagnosis: { value: T } | undefined;
+      try {
+        await h.orm.em.fork({ clear: true, useContext: false }).transactional(async em => {
+          expect(await em.execute('show transaction_isolation')).toEqual([{ transaction_isolation: 'repeatable read' }]);
+          const triggers = await em.execute<{ tgname: string; tgenabled: string; tgdeferrable: boolean; tginitdeferred: boolean }[]>(
+            `select tgname,tgenabled,tgdeferrable,tginitdeferred from pg_trigger where tgrelid in ('wallets'::regclass,'wallet_ledger_entries'::regclass) and tgname in ('trg_wallet_ledger_total','trg_ledger_wallet_total') order by tgname`);
+          expect(triggers).toHaveLength(2);
+          expect(triggers.every(t => t.tgenabled === 'O' && t.tgdeferrable && t.tginitdeferred)).toBe(true);
+          if (negative) {
+            const transactionId = crypto.randomUUID();
+            await em.execute(`insert into wager_transactions(id,provider_id,external_transaction_id,idempotency_key,payload_hash,wallet_id,player_id,round_id,game_id,kind,amount,currency,status,recorded_balance_amount,recorded_balance_currency,processed_at)
+              values(?,?,?,?,?,?,?,?,'fixture','BET',25,'BRL','PROCESSED',75,'BRL',now())`,
+              [transactionId, 'reconciliation-fixture', crypto.randomUUID(), crypto.randomUUID(), 'a'.repeat(64), wallet.id, wallet.playerId, crypto.randomUUID()]);
+            await em.execute(`insert into wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount,currency,balance_before,balance_after) values(?,?,?,'DEBIT',25,'BRL',100,75)`,
+              [crypto.randomUUID(), wallet.id, transactionId]);
+          } else {
+            await em.execute('update wallets set balance=?,version=version+1 where id=?', [mode === 'stored-above' ? '105.00' : '95.00', wallet.id]);
+          }
+          const store = new PostgresFinancialStore(em);
+          expect(await store.ledgerTotal(wallet.id)).toEqual({ amount: negative ? '-25.00' : '100.00', count: 1 });
+          const fixtureState = await reconciliationSnapshot(em);
+          diagnosis = { value: await work(store) }; captured++;
+          expect(await reconciliationSnapshot(em)).toEqual(fixtureState); // The diagnosis did not repair or mutate the fixture.
+        }, { isolationLevel: IsolationLevel.REPEATABLE_READ });
+        throw new Error('Inconsistent fixture unexpectedly committed');
+      } catch (error) {
+        if (sqlError(error).code !== '23514' || !diagnosis) throw error;
+        rejectedCommits++;
+        return diagnosis.value;
+      }
+    } };
+    const application = await start(fixture); const log = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (let i = 1; i <= 2; i++) {
+        const response = await reconciliationPost(wallet.id, await application.getUrl()); expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ walletId: wallet.id,
+          storedBalance: { amount: negative ? '0.00' : mode === 'stored-above' ? '105.00' : '95.00', currency: 'BRL' },
+          calculatedBalance: { amount: negative ? '-25.00' : '100.00', currency: 'BRL' },
+          difference: { amount: negative ? '25.00' : mode === 'stored-above' ? '5.00' : '-5.00', currency: 'BRL' }, consistent: false, checkedEntries: 1 });
+        expect(application.get(ReconcileWalletUseCase).divergenceObservations).toBe(BigInt(i));
+        expect(log).toHaveBeenCalledTimes(i);
+        expect(JSON.parse(log.mock.calls[i - 1]![0] as string)).toEqual({ event: 'WalletReconciliationMismatch', walletId: wallet.id, correlationId: response.headers.get('x-correlation-id') });
+        expect(await ledgerDatabaseSnapshot()).toEqual(before); // All fixture mutations were rolled back.
+      }
+      expect(captured).toBe(2); expect(rejectedCommits).toBe(2);
+      expect((await h.reconcile.execute(wallet.id)).consistent).toBe(true);
+    } finally { log.mockRestore(); await application.close(); }
+  });
+}
+
+test('CP04 REPEATABLE READ barrier preserves snapshot across a concurrent committed debit', async () => {
+  const wallet = await h.wallet('100.00'); let signal!: () => void; let release!: () => void; let paused = false;
+  const read = new Promise<void>(resolve => { signal = resolve; }); const gate = new Promise<void>(resolve => { release = resolve; });
+  const isolated: FinancialUnitOfWork = { run: (work, isolation) => {
+    expect(isolation).toBe('repeatable read');
+    return h.uow.run(store => work(new Proxy(store, {
+      get(target, key) {
+        if (key === 'getWallet') return async (id: string) => {
+          const result = await target.getWallet(id);
+          if (!paused) { paused = true; signal(); await gate; }
+          return result;
+        };
+        if (key === 'ledgerTotal') return async (id: string) => {
+          const em = Reflect.get(target, 'em') as import('@mikro-orm/postgresql').EntityManager;
+          expect(await em.execute('show transaction_isolation')).toEqual([{ transaction_isolation: 'repeatable read' }]);
+          return target.ledgerTotal(id);
+        };
+        const value: unknown = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value;
+      },
+    })), isolation);
+  } };
+  const application = await start(isolated);
+  let pending: Promise<Response> | undefined;
+  try {
+    pending = reconciliationPost(wallet.id, await application.getUrl());
+    await read;
+    await h.process.execute(request(wallet, { money: { amount: '25.00', currency: 'BRL' } })); // Commit finishes while reconciliation is paused.
+    expect((await h.get.execute(wallet.id)).balance.toString()).toBe('75.00');
+    const afterMovement = await ledgerDatabaseSnapshot(); release();
+    const first = await pending; expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ walletId: wallet.id, storedBalance: { amount: '100.00', currency: 'BRL' }, calculatedBalance: { amount: '100.00', currency: 'BRL' }, difference: { amount: '0.00', currency: 'BRL' }, consistent: true, checkedEntries: 1 });
+    const second = await reconciliationPost(wallet.id, await application.getUrl()); expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({ walletId: wallet.id, storedBalance: { amount: '75.00', currency: 'BRL' }, calculatedBalance: { amount: '75.00', currency: 'BRL' }, difference: { amount: '0.00', currency: 'BRL' }, consistent: true, checkedEntries: 2 });
+    expect(await ledgerDatabaseSnapshot()).toEqual(afterMovement);
+    expect(application.get(ReconcileWalletUseCase).divergenceObservations).toBe(0n);
+  } finally { release(); if (pending) await pending; await application.close(); }
+}, 15000);
