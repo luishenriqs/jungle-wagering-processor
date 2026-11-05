@@ -14,6 +14,7 @@ import { localSqsClient } from './infrastructure/local-sqs-client';
 import { AwsSqsConsumerTransport } from './infrastructure/aws-sqs-consumer-transport';
 import { ConsumerLifecycle } from './infrastructure/consumer-lifecycle';
 import type { SQSClient } from '@aws-sdk/client-sqs';
+import { stderrOperationalLog } from '../../shared/infrastructure/structured-logger';
 
 const SQS_CLIENT = Symbol('SQS_CLIENT'); const CONFIG = Symbol('SQS_CONSUMER_CONFIG');
 @Module({})
@@ -30,7 +31,8 @@ export class MessagingModule {
           catch (error) { client.destroy(); throw error; }
         } },
       { provide: SqsWagerConsumer, inject: [ProcessWagerTransactionUseCase, AwsSqsConsumerTransport, CLOCK, CONFIG],
-        useFactory: (processor: ProcessWagerTransactionUseCase, transport: AwsSqsConsumerTransport, clock: ClockPort, config: ConsumerConfig) => new SqsWagerConsumer(processor, transport, clock, config) },
+        useFactory: (processor: ProcessWagerTransactionUseCase, transport: AwsSqsConsumerTransport, clock: ClockPort, config: ConsumerConfig) =>
+          new SqsWagerConsumer(processor, transport, clock, config, undefined, { operationalLog: stderrOperationalLog }) },
       { provide: ConsumerLifecycle, inject: [SqsWagerConsumer, SQS_CLIENT],
         useFactory: (consumer: SqsWagerConsumer, client: SQSClient) => new ConsumerLifecycle(consumer, client) },
     ], exports: [SqsWagerConsumer] };
@@ -54,7 +56,7 @@ export class MessagingModule {
         } },
       { provide: OutboxPublisher, inject: [FINANCIAL_UNIT_OF_WORK, AwsSqsOutboxTransport, CLOCK, CONFIG],
         useFactory: (uow: FinancialUnitOfWork, transport: AwsSqsOutboxTransport, clock: ClockPort, config: WorkerConfig) =>
-          new OutboxPublisher(uow, transport, clock, config, { workerId: process.env['OUTBOX_WORKER_ID'] ?? `outbox-${process.pid}-${randomUUID()}` }) },
+          new OutboxPublisher(uow, transport, clock, config, { workerId: process.env['OUTBOX_WORKER_ID'] ?? `outbox-${process.pid}-${randomUUID()}`, operationalLog: stderrOperationalLog }) },
       { provide: PublisherLifecycle, inject: [OutboxPublisher, SQS_CLIENT, POLL],
         useFactory: (publisher: OutboxPublisher, client: SQSClient, pollMs: number) => new PublisherLifecycle(publisher, client, pollMs) },
     ], exports: [OutboxPublisher] };

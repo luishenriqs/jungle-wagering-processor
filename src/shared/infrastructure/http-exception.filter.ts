@@ -1,7 +1,10 @@
-import { Catch, HttpException, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common';
+import { Catch, HttpException, Inject, Optional, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common';
 import { ConflictError, NotFoundError, PersistenceInvariantError, RetryExhaustedError, WagerNotFoundError, sqlError } from '../application/application-errors';
 import { isTransient } from '../application/execution';
 import { CurrencyMismatchError, IdempotencyConflictError, InvalidDomainInputError, InvalidMoneyError, MoneyOverflowError } from '../domain/domain-errors';
+import { operationalEmitter, type OperationalLoggingOptions } from '../application/operational-logging';
+
+export const HTTP_OPERATIONAL_LOGGING_OPTIONS = Symbol('HTTP_OPERATIONAL_LOGGING_OPTIONS');
 
 export function publicHttpError(error: unknown): { status: number; code: string; message: string } {
   if (error instanceof HttpException) {
@@ -33,12 +36,18 @@ export function publicHttpError(error: unknown): { status: number; code: string;
 }
 @Catch()
 export class HttpExceptionFilter implements ExceptionFilter {
+  private readonly observe;
+  constructor(@Optional() @Inject(HTTP_OPERATIONAL_LOGGING_OPTIONS) options: OperationalLoggingOptions = {}) {
+    this.observe = operationalEmitter(options.operationalLog);
+  }
   catch(error: unknown, host: ArgumentsHost): void {
     const http = host.switchToHttp();
     const response = http.getResponse<{ status(value: number): { json(body: unknown): void }; setHeader(key: string, value: string): void }>();
     const request = http.getRequest<{ correlationId?: string }>();
     if (request.correlationId) response.setHeader('x-correlation-id', request.correlationId);
     const { status, ...body } = publicHttpError(error);
+    if (status >= 500) this.observe({ component: 'http', event: 'operational_error', level: 'error',
+      code: body.code, correlationId: request.correlationId });
     response.status(status).json(body);
   }
 }

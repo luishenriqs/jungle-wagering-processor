@@ -11,8 +11,18 @@ import { CreateWalletUseCase } from '../modules/wallets/application/create-walle
 import { GetWalletUseCase, ListWalletLedgerUseCase, ReconcileWalletUseCase } from '../modules/wallets/application/wallet-queries';
 import { ProcessWagerTransactionUseCase } from '../modules/wagering/application/process-wager-transaction.use-case';
 import { GetWagerTransactionUseCase } from '../modules/wagering/application/get-wager-transaction.use-case';
+import { stderrOperationalLog } from '../shared/infrastructure/structured-logger';
 
 const cases = [CreateWalletUseCase, GetWalletUseCase, ListWalletLedgerUseCase, ReconcileWalletUseCase, ProcessWagerTransactionUseCase, GetWagerTransactionUseCase];
+function caseProviders() {
+  return cases.map(useCase => ({ provide: useCase, inject: [FINANCIAL_UNIT_OF_WORK], useFactory: (work: FinancialUnitOfWork) => {
+    const options = { operationalLog: stderrOperationalLog };
+    if (useCase === CreateWalletUseCase) return new CreateWalletUseCase(work, options);
+    if (useCase === ProcessWagerTransactionUseCase) return new ProcessWagerTransactionUseCase(work, options);
+    if (useCase === ReconcileWalletUseCase) return new ReconcileWalletUseCase(work);
+    return new useCase(work);
+  } }));
+}
 @Module({})
 export class DatabaseModule {
   /** HTTP owns exactly one ORM; an injected UoW retains ownership with its caller. */
@@ -40,14 +50,14 @@ export class DatabaseModule {
             return (signal: AbortSignal) => probe.check(signal);
           },
         },
-        ...cases.map(useCase => ({ provide: useCase, inject: [FINANCIAL_UNIT_OF_WORK], useFactory: (work: FinancialUnitOfWork) => new useCase(work) })),
+        ...caseProviders(),
       ], exports: [FINANCIAL_UNIT_OF_WORK, ...cases, POSTGRES_HEALTH_PROBE] };
   }
   static forRoot(): DynamicModule {
     return { module: DatabaseModule, imports: [MikroOrmModule.forRoot({ ...databaseConfig(), registerRequestContext: false })],
       providers: [
         { provide: FINANCIAL_UNIT_OF_WORK, inject: [CoreORM], useFactory: (orm: MikroORM) => new PostgresUnitOfWork(orm) },
-        ...cases.map(useCase => ({ provide: useCase, inject: [FINANCIAL_UNIT_OF_WORK], useFactory: (uow: FinancialUnitOfWork) => new useCase(uow) })),
+        ...caseProviders(),
       ], exports: [FINANCIAL_UNIT_OF_WORK, ...cases] };
   }
 }

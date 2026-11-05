@@ -7,6 +7,7 @@ import { CLOCK, SystemClock, type ClockPort } from '../../shared/application/clo
 import { pendingReferencePolicy, type PendingReferencePolicy } from './application/pending-reference-policy';
 import { PendingReferenceWorker } from './application/pending-reference-worker';
 import { PendingReferenceLifecycle } from './infrastructure/pending-reference-lifecycle';
+import { stderrOperationalLog } from '../../shared/infrastructure/structured-logger';
 
 @Module({})
 export class WageringModule {
@@ -27,7 +28,8 @@ export class WageringModule {
         return { pollMs: integer('PENDING_REF_POLL_INTERVAL_MS', 250, 60000), batchSize: integer('PENDING_REF_BATCH_SIZE', 100, 1000) };
       } },
       { provide: PendingReferenceWorker, inject: [FINANCIAL_UNIT_OF_WORK, CLOCK, POLICY],
-        useFactory: (uow: FinancialUnitOfWork, clock: ClockPort, policy: PendingReferencePolicy) => new PendingReferenceWorker(uow, clock, policy) },
+        useFactory: (uow: FinancialUnitOfWork, clock: ClockPort, policy: PendingReferencePolicy) =>
+          new PendingReferenceWorker(uow, clock, policy, { operationalLog: stderrOperationalLog }) },
       { provide: PendingReferenceLifecycle, inject: [PendingReferenceWorker, LOOP],
         useFactory: (worker: PendingReferenceWorker, loop: { pollMs: number; batchSize: number }) => new PendingReferenceLifecycle(worker, loop.pollMs, loop.batchSize) },
     ], exports: [PendingReferenceWorker] };

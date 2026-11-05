@@ -3,6 +3,7 @@ import { NotFoundError, PersistenceInvariantError } from '../../../shared/applic
 import { internalId } from '../../../shared/application/identifiers';
 import { CurrencyMismatchError, InvalidDomainInputError, InvalidMoneyError, MoneyOverflowError } from '../../../shared/domain/domain-errors';
 import { Money } from '../../../shared/domain/money';
+import { isolatedObserver, operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
 
 export class GetWalletUseCase {
   constructor(private readonly uow: FinancialUnitOfWork) {}
@@ -46,10 +47,14 @@ export class ListWalletLedgerUseCase {
 /** Operational observations are per instance/process, not distinct financial incidents. */
 export class ReconcileWalletUseCase {
   #divergenceObservations = 0n;
+  private readonly observe;
+  private readonly legacyLog;
   constructor(private readonly uow: FinancialUnitOfWork, private readonly telemetry: {
     log?: (event: { event: 'WalletReconciliationMismatch'; walletId: string; correlationId?: string }) => void;
     metric?: (total: bigint) => void;
-  } = {}) {}
+  } & OperationalLoggingOptions = {}) {
+    this.observe = operationalEmitter(telemetry.operationalLog); this.legacyLog = isolatedObserver(telemetry.log);
+  }
   /** Monotonic total available to a future metrics collector without wallet labels. */
   get divergenceObservations(): bigint { return this.#divergenceObservations; }
   async execute(id: string, context?: { correlationId: string }) {
@@ -84,7 +89,10 @@ export class ReconcileWalletUseCase {
       try {
         const event = { event: 'WalletReconciliationMismatch' as const, walletId: result.walletId,
           ...(context ? { correlationId: context.correlationId } : {}) };
-        if (this.telemetry.log) this.telemetry.log(event); else console.warn(JSON.stringify(event));
+        if (this.telemetry.log) this.legacyLog(event);
+        else if (this.telemetry.operationalLog) this.observe({ component: 'wallets', event: 'reconciliation_divergence', level: 'warn',
+          walletId: result.walletId, correlationId: context?.correlationId });
+        else console.warn(JSON.stringify(event));
       } catch { /* Logging failure cannot invalidate financial reads. */ }
     }
     return result;

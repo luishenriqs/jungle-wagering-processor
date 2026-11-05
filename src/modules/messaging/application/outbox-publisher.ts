@@ -5,12 +5,13 @@ import { internalId } from '../../../shared/application/identifiers';
 import { dateCopy, requireText } from '../../../shared/domain/validation';
 import type { OutboxMessage } from '../domain/outbox-message';
 import type { WorkerConfig } from './worker-config';
+import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
 
 export interface OutboxTransport { publish(message: OutboxMessage, signal: AbortSignal): Promise<void> }
 export interface PublisherDiagnostic {
   readonly component: 'outbox-publisher'; readonly action: string; readonly code: string; readonly eventId?: string;
 }
-export interface PublisherOptions {
+export interface PublisherOptions extends OperationalLoggingOptions {
   readonly workerId: string;
   readonly newToken?: () => string;
   readonly diagnose?: (event: PublisherDiagnostic) => void;
@@ -23,6 +24,7 @@ export class OutboxPublisher {
   private readonly workerId: string;
   private readonly newToken: () => string;
   private readonly diagnose: (event: PublisherDiagnostic) => void;
+  private readonly observe;
   constructor(private readonly uow: FinancialUnitOfWork, private readonly transport: OutboxTransport,
     private readonly clock: ClockPort, config: WorkerConfig, options: PublisherOptions) {
     requireText(options.workerId, 'workerId');
@@ -33,6 +35,7 @@ export class OutboxPublisher {
     this.config = Object.freeze({ ...config }); this.workerId = options.workerId;
     this.newToken = options.newToken ?? randomUUID;
     this.diagnose = options.diagnose ?? (event => console.log(JSON.stringify(event)));
+    this.observe = operationalEmitter(options.operationalLog);
   }
   async publishNext(): Promise<PublishOutcome> {
     const now = dateCopy(this.clock.now());
@@ -41,11 +44,17 @@ export class OutboxPublisher {
       { baseDelayMs: this.config.outboxBaseRetryMs, maxDelayMs: this.config.outboxMaxRetryMs }));
     if (!claim) return { action: 'idle' };
     const eventId = claim.message.id;
+    const context = { eventId, walletId: claim.message.aggregateId, correlationId: claim.message.payload['correlationId'] };
     // The claim transaction is committed. Never hold its locks while talking to SQS.
     if (claim.leaseUntil.getTime() - dateCopy(this.clock.now()).getTime() < this.config.sqsSendTimeoutMs + 1000) {
-      this.log('lease-lost', 'INSUFFICIENT_LEASE_TIME', eventId); return { action: 'lease-lost', eventId };
+      this.log('lease-lost', 'INSUFFICIENT_LEASE_TIME', eventId);
+      this.observe({ component: 'outbox-publisher', event: 'outbox_lease_lost', code: 'INSUFFICIENT_LEASE_TIME', ...context });
+      return { action: 'lease-lost', eventId };
     }
-    try { await this.send(claim.message); }
+    try {
+      await this.send(claim.message);
+      this.observe({ component: 'outbox-publisher', event: 'outbox_sent', ...context });
+    }
     catch (error) {
       const at = dateCopy(this.clock.now());
       const code = error instanceof Error && ['AbortError', 'TimeoutError', 'OutboxSendTimeout'].includes(error.name)
@@ -54,6 +63,7 @@ export class OutboxPublisher {
       try {
         const updated = await this.uow.run(store => store.failOutbox(claim.message, claim.workerId, claim.leaseToken, at, code));
         this.log(updated ? 'retry-scheduled' : 'lease-lost', code, eventId);
+        this.observe({ component: 'outbox-publisher', event: updated ? 'outbox_retry_scheduled' : 'outbox_lease_lost', code, ...context });
         return { action: updated ? 'retry-scheduled' : 'lease-lost', eventId };
       } catch {
         // DB recovery and lease expiration will make the event claimable again. Never discard it.
@@ -64,9 +74,12 @@ export class OutboxPublisher {
     try {
       const completed = await this.uow.run(store => store.completeOutbox(eventId, claim.workerId, claim.leaseToken, dateCopy(this.clock.now())));
       this.log(completed ? 'published' : 'lease-lost', completed ? 'PUBLISHED' : 'FENCED', eventId);
+      this.observe({ component: 'outbox-publisher', event: completed ? 'outbox_confirmed' : 'outbox_lease_lost',
+        ...(completed ? {} : { code: 'FENCED' }), ...context });
       return { action: completed ? 'published' : 'lease-lost', eventId };
     } catch {
       this.log('confirmation-pending', 'CONFIRMATION_PERSIST_FAILED', eventId);
+      this.observe({ component: 'outbox-publisher', event: 'outbox_confirmation_pending', code: 'CONFIRMATION_PERSIST_FAILED', ...context });
       return { action: 'confirmation-pending', eventId };
     }
   }

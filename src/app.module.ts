@@ -6,14 +6,18 @@ import { APP_FILTER, HttpAdapterHost } from '@nestjs/core';
 import { WalletsModule } from './modules/wallets/wallets.module';
 import { WageringModule } from './modules/wagering/wagering.module';
 import { DatabaseModule } from './database/database.module';
-import { HttpExceptionFilter } from './shared/infrastructure/http-exception.filter';
+import { HttpExceptionFilter, HTTP_OPERATIONAL_LOGGING_OPTIONS } from './shared/infrastructure/http-exception.filter';
 import type { FinancialUnitOfWork } from './shared/application/financial-store';
+import { stderrOperationalLog } from './shared/infrastructure/structured-logger';
 
 function httpModules(uow?: FinancialUnitOfWork, health?: HealthOptions) {
   const database = DatabaseModule.forHttp(uow);
   return [WalletsModule.register(database), WageringModule.forHttp(database), HealthHttpModule.register(database, health)];
 }
-const httpProviders = [{ provide: APP_FILTER, useClass: HttpExceptionFilter }];
+const httpProviders = [
+  { provide: HTTP_OPERATIONAL_LOGGING_OPTIONS, useValue: { operationalLog: stderrOperationalLog } },
+  { provide: APP_FILTER, useClass: HttpExceptionFilter },
+];
 class HttpFoundation {
   constructor(@Inject(HttpAdapterHost) host: HttpAdapterHost) {
     // Install before Nest's JSON parser so malformed requests are also correlated.

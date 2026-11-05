@@ -17,8 +17,9 @@ import { WagerTransactionRejected } from '../domain/events/wager-transaction-rej
 import { WagerTransactionPendingReference } from '../domain/events/wager-transaction-pending-reference';
 import { FailureCode } from '../domain/failure-code';
 import { wagerPayloadHash, type WagerPayload } from './wager-payload';
+import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
 
-export interface ProcessWagerOptions extends ExecutionOptions { readonly pendingReferencePolicy?: PendingReferencePolicy }
+export interface ProcessWagerOptions extends ExecutionOptions, OperationalLoggingOptions { readonly pendingReferencePolicy?: PendingReferencePolicy }
 export interface ProcessWagerInput extends WagerPayload {
   readonly idempotencyKey: string;
   readonly correlationId: string;
@@ -36,8 +37,10 @@ const BUSINESS_UNIQUES = new Set(['uq_wager_idempotency', 'uq_wager_provider_ext
 export class ProcessWagerTransactionUseCase {
   private readonly runtime;
   private readonly referencePolicy: PendingReferencePolicy;
+  private readonly observe;
   constructor(private readonly uow: FinancialUnitOfWork, options: ProcessWagerOptions = {}) {
     this.runtime = execution(options);
+    this.observe = operationalEmitter(options.operationalLog);
     this.referencePolicy = validatePendingReferencePolicy(options.pendingReferencePolicy ?? pendingReferencePolicy());
   }
   async execute(input: ProcessWagerInput): Promise<ProcessWagerResult> {
@@ -51,77 +54,88 @@ export class ProcessWagerTransactionUseCase {
     // Validate all external domain rules before opening a database transaction.
     WagerTransaction.create(props);
     const received = input.inbox && InboxMessage.receive({ ...input.inbox, payloadHash });
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await this.uow.run(async store => {
-          // Read-only identity checks ensure an already-used key conflicts even for a missing target wallet.
-          this.matchWinner(await store.findIdentity(identity.idempotencyKey, identity.providerId, identity.externalTransactionId), identity);
-          const wallet = await store.getWallet(normalized.walletId, true); // FIRST acquired financial lock.
-          if (!wallet) {
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const result = await this.uow.run(async store => {
+            // Read-only identity checks ensure an already-used key conflicts even for a missing target wallet.
             this.matchWinner(await store.findIdentity(identity.idempotencyKey, identity.providerId, identity.externalTransactionId), identity);
-            throw new NotFoundError('Wallet not found');
-          }
-          let inbox: InboxMessage | undefined;
-          let newInbox = false;
-          if (received) {
-            const claim = await store.claimInbox(received); // BEFORE wager locks or inserts.
-            inbox = claim.message; newInbox = claim.inserted;
-            inbox.assertSamePayload(payloadHash);
-            if (!newInbox && !inbox.isProcessed()) throw new PersistenceInvariantError('Committed Inbox is unprocessed');
-          }
-          const winner = this.matchWinner(await store.findIdentity(identity.idempotencyKey, identity.providerId, identity.externalTransactionId), identity);
-          if (winner) {
-            if (inbox && newInbox) { inbox.markProcessed(at); await store.finishInbox(inbox); await this.runtime.checkpoint('inbox'); }
-            await this.runtime.checkpoint('beforeCommit');
-            return this.result(winner, true);
-          }
-          if (inbox && !newInbox) throw new PersistenceInvariantError('Processed Inbox has no matching wager');
-          if (wallet.playerId !== input.playerId) throw new InvalidDomainInputError('Wallet does not belong to player');
-          const tx = WagerTransaction.create(props); // Fresh object for every attempt.
-          let reference = tx.expectsReference() ? await store.findWager(tx.providerId, tx.referenceExternalTransactionId!) : undefined;
-          if (reference?.walletId === wallet.id) reference = await store.getWager(reference.id, true);
-          // Never lock the other wallet or its wager for an invalid cross-wallet reference.
-          const decision = evaluateWager(tx, { walletId: wallet.id, playerId: wallet.playerId, balance: wallet.balance,
-            ...(reference ? { reference } : {}), referenceAlreadyReversed: reference?.walletId === wallet.id ? await store.isReversed(reference.id) : false });
-          const context = () => ({ eventId: this.runtime.newId(), correlationId: input.correlationId, causationId: input.causationId, occurredAt: at });
-          let entry: WalletLedgerEntry | undefined;
-          if (decision.status === 'PROCESSED') {
-            if (decision.direction) {
-              const movement = { transactionId: tx.id, ledgerEntryId: this.runtime.newId(), money: tx.money, at };
-              entry = decision.direction === LedgerDirection.Debit
-                ? wallet.debit({ ...movement, insufficientFundsCode: tx.kind === 'BET' ? FailureCode.InsufficientFundsBet : FailureCode.InsufficientFundsReversal })
-                : wallet.credit(movement);
-              await store.updateWallet(wallet);
+            const wallet = await store.getWallet(normalized.walletId, true); // FIRST acquired financial lock.
+            if (!wallet) {
+              this.matchWinner(await store.findIdentity(identity.idempotencyKey, identity.providerId, identity.externalTransactionId), identity);
+              throw new NotFoundError('Wallet not found');
             }
-            await this.runtime.checkpoint('wallet');
-            tx.markProcessed(tx.expectsReference() ? reference?.id : undefined, at, wallet.balance);
-          } else if (decision.status === 'REJECTED') tx.reject(decision.code, wallet.balance);
-          else tx.markPendingReference(wallet.balance, initialReferenceSchedule(at, this.referencePolicy));
-          await store.insertWager(tx); await this.runtime.checkpoint('wager');
-          if (entry) await store.appendLedger(entry);
-          await this.runtime.checkpoint('ledger');
-          const event = decision.status === 'PROCESSED' ? WagerTransactionProcessed.from(tx, context())
-            : decision.status === 'REJECTED' ? WagerTransactionRejected.from(tx, context()) : WagerTransactionPendingReference.from(tx, context());
-          await store.enqueue(OutboxMessage.enqueue(event));
-          if (entry) await store.enqueue(OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, entry, context())));
-          await this.runtime.checkpoint('outbox');
-          if (inbox) { inbox.markProcessed(at); await store.finishInbox(inbox); }
-          await this.runtime.checkpoint('inbox');
-          await this.runtime.checkpoint('beforeCommit');
-          return this.result(tx, false);
-        });
-      } catch (error) {
-        const sql = sqlError(error);
-        const businessCollision = sql.code === '23505' && BUSINESS_UNIQUES.has(sql.constraint ?? '');
-        if (businessCollision) {
-          // The aborted context is gone. Re-read the winner without locking its wallet.
-          await this.uow.run(async store => {
-            this.matchWinner(await store.findIdentity(identity.idempotencyKey, identity.providerId, identity.externalTransactionId), identity);
+            let inbox: InboxMessage | undefined;
+            let newInbox = false;
+            if (received) {
+              const claim = await store.claimInbox(received); // BEFORE wager locks or inserts.
+              inbox = claim.message; newInbox = claim.inserted;
+              inbox.assertSamePayload(payloadHash);
+              if (!newInbox && !inbox.isProcessed()) throw new PersistenceInvariantError('Committed Inbox is unprocessed');
+            }
+            const winner = this.matchWinner(await store.findIdentity(identity.idempotencyKey, identity.providerId, identity.externalTransactionId), identity);
+            if (winner) {
+              if (inbox && newInbox) { inbox.markProcessed(at); await store.finishInbox(inbox); await this.runtime.checkpoint('inbox'); }
+              await this.runtime.checkpoint('beforeCommit');
+              return this.result(winner, true);
+            }
+            if (inbox && !newInbox) throw new PersistenceInvariantError('Processed Inbox has no matching wager');
+            if (wallet.playerId !== input.playerId) throw new InvalidDomainInputError('Wallet does not belong to player');
+            const tx = WagerTransaction.create(props); // Fresh object for every attempt.
+            let reference = tx.expectsReference() ? await store.findWager(tx.providerId, tx.referenceExternalTransactionId!) : undefined;
+            if (reference?.walletId === wallet.id) reference = await store.getWager(reference.id, true);
+            // Never lock the other wallet or its wager for an invalid cross-wallet reference.
+            const decision = evaluateWager(tx, { walletId: wallet.id, playerId: wallet.playerId, balance: wallet.balance,
+              ...(reference ? { reference } : {}), referenceAlreadyReversed: reference?.walletId === wallet.id ? await store.isReversed(reference.id) : false });
+            const context = () => ({ eventId: this.runtime.newId(), correlationId: input.correlationId, causationId: input.causationId, occurredAt: at });
+            let entry: WalletLedgerEntry | undefined;
+            if (decision.status === 'PROCESSED') {
+              if (decision.direction) {
+                const movement = { transactionId: tx.id, ledgerEntryId: this.runtime.newId(), money: tx.money, at };
+                entry = decision.direction === LedgerDirection.Debit
+                  ? wallet.debit({ ...movement, insufficientFundsCode: tx.kind === 'BET' ? FailureCode.InsufficientFundsBet : FailureCode.InsufficientFundsReversal })
+                  : wallet.credit(movement);
+                await store.updateWallet(wallet);
+              }
+              await this.runtime.checkpoint('wallet');
+              tx.markProcessed(tx.expectsReference() ? reference?.id : undefined, at, wallet.balance);
+            } else if (decision.status === 'REJECTED') tx.reject(decision.code, wallet.balance);
+            else tx.markPendingReference(wallet.balance, initialReferenceSchedule(at, this.referencePolicy));
+            await store.insertWager(tx); await this.runtime.checkpoint('wager');
+            if (entry) await store.appendLedger(entry);
+            await this.runtime.checkpoint('ledger');
+            const event = decision.status === 'PROCESSED' ? WagerTransactionProcessed.from(tx, context())
+              : decision.status === 'REJECTED' ? WagerTransactionRejected.from(tx, context()) : WagerTransactionPendingReference.from(tx, context());
+            await store.enqueue(OutboxMessage.enqueue(event));
+            if (entry) await store.enqueue(OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, entry, context())));
+            await this.runtime.checkpoint('outbox');
+            if (inbox) { inbox.markProcessed(at); await store.finishInbox(inbox); }
+            await this.runtime.checkpoint('inbox');
+            await this.runtime.checkpoint('beforeCommit');
+            return this.result(tx, false);
           });
-        } else if (!isTransient(error)) throw error;
-        if (attempt + 1 >= this.runtime.maxAttempts) throw exhausted(error);
-        await retryDelay(attempt); // No locks or transaction held while waiting.
+          this.observe({ component: 'wagering', event: result.idempotentReplay ? 'wager_replayed'
+            : result.status === 'PROCESSED' ? 'wager_processed' : result.status === 'REJECTED' ? 'wager_rejected' : 'wager_pending_reference',
+            transactionId: result.transactionId, walletId: normalized.walletId, providerId: input.providerId,
+            correlationId: input.correlationId, status: result.status, code: result.failureCode, idempotentReplay: result.idempotentReplay });
+          return result;
+        } catch (error) {
+          const sql = sqlError(error);
+          const businessCollision = sql.code === '23505' && BUSINESS_UNIQUES.has(sql.constraint ?? '');
+          if (businessCollision) {
+            // The aborted context is gone. Re-read the winner without locking its wallet.
+            await this.uow.run(async store => {
+              this.matchWinner(await store.findIdentity(identity.idempotencyKey, identity.providerId, identity.externalTransactionId), identity);
+            });
+          } else if (!isTransient(error)) throw error;
+          if (attempt + 1 >= this.runtime.maxAttempts) throw exhausted(error);
+          await retryDelay(attempt); // No locks or transaction held while waiting.
+        }
       }
+    } catch (error) {
+      if (error instanceof IdempotencyConflictError) this.observe({ component: 'wagering', event: 'idempotency_conflict',
+        code: 'IDEMPOTENCY_CONFLICT', walletId: normalized.walletId, providerId: input.providerId, correlationId: input.correlationId });
+      throw error;
     }
   }
   private matchWinner(rows: WagerTransaction[], identity: Parameters<WagerTransaction['assertReplay']>[0]): WagerTransaction | undefined {

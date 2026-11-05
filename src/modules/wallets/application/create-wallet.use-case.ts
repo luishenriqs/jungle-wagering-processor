@@ -7,10 +7,14 @@ import { OutboxMessage } from '../../messaging/domain/outbox-message';
 import { createWalletOpening } from '../../wagering/domain/wallet-opening';
 import { wagerPayloadHash } from '../../wagering/application/wager-payload';
 import { WagerTransactionKind } from '../../wagering/domain/wager-transaction';
+import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
 
 export class CreateWalletUseCase {
   private readonly runtime;
-  constructor(private readonly uow: FinancialUnitOfWork, options: ExecutionOptions = {}) { this.runtime = execution(options); }
+  private readonly observe;
+  constructor(private readonly uow: FinancialUnitOfWork, options: ExecutionOptions & OperationalLoggingOptions = {}) {
+    this.runtime = execution(options); this.observe = operationalEmitter(options.operationalLog);
+  }
   async execute(input: { playerId: string; initialBalance: MoneyProps; correlationId: string }) {
     requireText(input.playerId, 'playerId');
     requireText(input.correlationId, 'correlationId');
@@ -23,7 +27,7 @@ export class CreateWalletUseCase {
       context: { correlationId: input.correlationId, occurredAt: this.runtime.now() } });
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.uow.run(async store => {
+        const wallet = await this.uow.run(async store => {
           await store.insertWallet(bundle.wallet);
           await this.runtime.checkpoint('wallet');
           if (bundle.transaction && bundle.entry) {
@@ -35,6 +39,8 @@ export class CreateWalletUseCase {
           await this.runtime.checkpoint('beforeCommit');
           return bundle.wallet;
         });
+        this.observe({ component: 'wallets', event: 'wallet_created', walletId: wallet.id, correlationId: input.correlationId });
+        return wallet;
       } catch (error) {
         const sql = sqlError(error);
         if (sql.code === '23505' && sql.constraint === 'uq_wallet_player_currency') throw new ConflictError('Wallet already exists for player and currency', { cause: error });

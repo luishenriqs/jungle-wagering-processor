@@ -13,20 +13,23 @@ import { FailureCode } from '../domain/failure-code';
 import { WagerTransactionProcessed } from '../domain/events/wager-transaction-processed';
 import { WagerTransactionRejected } from '../domain/events/wager-transaction-rejected';
 import { nextReferenceRetry, pendingReferencePolicy, validatePendingReferencePolicy, type PendingReferencePolicy } from './pending-reference-policy';
+import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
 
 export interface PendingCandidate { readonly id: string; readonly walletId: string }
 export interface PendingResolution { readonly transactionId: string; readonly action: 'processed' | 'rejected' | 'rescheduled' | 'noop' | 'retry' }
-export interface PendingWorkerOptions extends Omit<ExecutionOptions, 'now'> {
+export interface PendingWorkerOptions extends Omit<ExecutionOptions, 'now'>, OperationalLoggingOptions {
   readonly diagnose?: (event: { readonly component: 'pending-reference-worker'; readonly code: string; readonly transactionId?: string }) => void;
 }
 export class PendingReferenceWorker {
   private readonly runtime;
   private readonly policy: PendingReferencePolicy;
   private readonly diagnose: NonNullable<PendingWorkerOptions['diagnose']>;
+  private readonly observe;
   constructor(private readonly uow: FinancialUnitOfWork, private readonly clock: ClockPort,
     policy: PendingReferencePolicy = pendingReferencePolicy(), options: PendingWorkerOptions = {}) {
     this.policy = validatePendingReferencePolicy(policy);
     this.runtime = execution({ ...options, now: () => this.clock.now() });
+    this.observe = operationalEmitter(options.operationalLog);
     this.diagnose = options.diagnose ?? (event => console.log(JSON.stringify(event)));
   }
   async runOnce(limit = 100, signal?: AbortSignal): Promise<PendingResolution[]> {
@@ -48,7 +51,7 @@ export class PendingReferenceWorker {
     const walletId = internalId(candidate.walletId); const transactionId = internalId(candidate.id);
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.uow.run(async store => {
+        const result = await this.uow.run<PendingResolution>(async store => {
           const wallet = await store.getWallet(walletId, true); // Always the FIRST financial lock.
           if (!wallet) throw new PersistenceInvariantError('Pending wager wallet is missing');
           // Candidate discovery is nonlocking. Verify ownership without locking another wallet's wager,
@@ -104,6 +107,10 @@ export class PendingReferenceWorker {
           await this.runtime.checkpoint('outbox'); await this.runtime.checkpoint('beforeCommit');
           return { transactionId, action: decision.status === 'PROCESSED' ? 'processed' : 'rejected' };
         });
+        if (result.action !== 'noop') this.observe({ component: 'pending-reference-worker',
+          event: result.action === 'rescheduled' ? 'pending_reference_rescheduled' : 'pending_reference_resolved',
+          transactionId, walletId, status: result.action });
+        return result;
       } catch (error) {
         if (!isTransient(error)) throw error;
         if (attempt + 1 >= this.runtime.maxAttempts) throw exhausted(error);
