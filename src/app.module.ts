@@ -1,3 +1,5 @@
+import { HealthHttpModule } from './shared/infrastructure/health.controller';
+import type { HealthOptions } from './shared/infrastructure/health-readiness';
 import { randomUUID } from 'node:crypto';
 import { Inject, Module } from '@nestjs/common';
 import { APP_FILTER, HttpAdapterHost } from '@nestjs/core';
@@ -7,9 +9,9 @@ import { DatabaseModule } from './database/database.module';
 import { HttpExceptionFilter } from './shared/infrastructure/http-exception.filter';
 import type { FinancialUnitOfWork } from './shared/application/financial-store';
 
-function httpModules(uow?: FinancialUnitOfWork) {
+function httpModules(uow?: FinancialUnitOfWork, health?: HealthOptions) {
   const database = DatabaseModule.forHttp(uow);
-  return [WalletsModule.register(database), WageringModule.forHttp(database)];
+  return [WalletsModule.register(database), WageringModule.forHttp(database), HealthHttpModule.register(database, health)];
 }
 const httpProviders = [{ provide: APP_FILTER, useClass: HttpExceptionFilter }];
 class HttpFoundation {
@@ -27,7 +29,7 @@ class RegisteredHttpApplication extends HttpFoundation {}
 
 @Module({ imports: httpModules(), providers: httpProviders })
 export class AppModule extends HttpFoundation {
-  static register(options: { uow: FinancialUnitOfWork }) {
-    return { module: RegisteredHttpApplication, imports: httpModules(options.uow) };
+  static register(options: { uow: FinancialUnitOfWork; health?: HealthOptions }) {
+    return { module: RegisteredHttpApplication, imports: httpModules(options.uow, options.health) };
   }
 }

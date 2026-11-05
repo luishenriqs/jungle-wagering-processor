@@ -1,3 +1,4 @@
+import { PostgresHealthProbe, POSTGRES_HEALTH_PROBE } from '../shared/infrastructure/postgres-health.probe';
 import { Module, type DynamicModule } from '@nestjs/common';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { MikroORM as CoreORM } from '@mikro-orm/core';
@@ -32,8 +33,15 @@ export class DatabaseModule {
             ? new PostgresUnitOfWork(orm)
             : { async run() { throw new ServiceUnavailableException(); } },
         },
+        uow ? { provide: POSTGRES_HEALTH_PROBE, useValue: async () => { throw new ServiceUnavailableException(); } } : {
+          provide: POSTGRES_HEALTH_PROBE, inject: [CoreORM], useFactory: (orm: MikroORM | null) => {
+            if (!orm) return async () => { throw new ServiceUnavailableException(); };
+            const probe = new PostgresHealthProbe(orm);
+            return (signal: AbortSignal) => probe.check(signal);
+          },
+        },
         ...cases.map(useCase => ({ provide: useCase, inject: [FINANCIAL_UNIT_OF_WORK], useFactory: (work: FinancialUnitOfWork) => new useCase(work) })),
-      ], exports: [FINANCIAL_UNIT_OF_WORK, ...cases] };
+      ], exports: [FINANCIAL_UNIT_OF_WORK, ...cases, POSTGRES_HEALTH_PROBE] };
   }
   static forRoot(): DynamicModule {
     return { module: DatabaseModule, imports: [MikroOrmModule.forRoot({ ...databaseConfig(), registerRequestContext: false })],
