@@ -1,8 +1,14 @@
-import { Module } from '@nestjs/common';
+import { Module, type DynamicModule } from '@nestjs/common';
 import { WalletsModule } from './modules/wallets/wallets.module';
-import { WageringModule } from './modules/wagering/wagering.module';
-import { MessagingModule } from './modules/messaging/messaging.module';
-import { DatabaseModule } from './database/database.module';
+import type { FinancialUnitOfWork } from './shared/application/financial-store';
 
-@Module({ imports: [WalletsModule, WageringModule, MessagingModule, ...(process.env['DATABASE_URL'] ? [DatabaseModule.forRoot()] : [])] })
-export class AppModule {}
+// Separate root avoids merging the default production imports into an explicit test composition.
+@Module({})
+class RegisteredHttpApplication {}
+
+@Module({ imports: [WalletsModule.register()] })
+export class AppModule {
+  static register(options: { uow: FinancialUnitOfWork }): DynamicModule {
+    return { module: RegisteredHttpApplication, imports: [WalletsModule.register(options)] };
+  }
+}
