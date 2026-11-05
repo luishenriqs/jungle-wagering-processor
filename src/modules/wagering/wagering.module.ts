@@ -1,4 +1,6 @@
 import { Module, type DynamicModule } from '@nestjs/common';
+import { WageringController } from './infrastructure/wagering.controller';
+import { ProviderIdentityGuard } from '../../shared/infrastructure/provider-identity.guard';
 import { DatabaseModule } from '../../database/database.module';
 import { FINANCIAL_UNIT_OF_WORK, type FinancialUnitOfWork } from '../../shared/application/financial-store';
 import { CLOCK, SystemClock, type ClockPort } from '../../shared/application/clock';
@@ -8,6 +10,9 @@ import { PendingReferenceLifecycle } from './infrastructure/pending-reference-li
 
 @Module({})
 export class WageringModule {
+  static forHttp(database: DynamicModule): DynamicModule {
+    return { module: WageringModule, imports: [database], controllers: [WageringController], providers: [ProviderIdentityGuard] };
+  }
   static forPendingReferences(): DynamicModule {
     const POLICY = Symbol('PENDING_REFERENCE_POLICY'); const LOOP = Symbol('PENDING_REFERENCE_LOOP');
     return { module: WageringModule, imports: [DatabaseModule.forRoot()], providers: [

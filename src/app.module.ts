@@ -1,14 +1,33 @@
-import { Module, type DynamicModule } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { Inject, Module } from '@nestjs/common';
+import { APP_FILTER, HttpAdapterHost } from '@nestjs/core';
 import { WalletsModule } from './modules/wallets/wallets.module';
+import { WageringModule } from './modules/wagering/wagering.module';
+import { DatabaseModule } from './database/database.module';
+import { HttpExceptionFilter } from './shared/infrastructure/http-exception.filter';
 import type { FinancialUnitOfWork } from './shared/application/financial-store';
 
-// Separate root avoids merging the default production imports into an explicit test composition.
-@Module({})
-class RegisteredHttpApplication {}
+function httpModules(uow?: FinancialUnitOfWork) {
+  const database = DatabaseModule.forHttp(uow);
+  return [WalletsModule.register(database), WageringModule.forHttp(database)];
+}
+const httpProviders = [{ provide: APP_FILTER, useClass: HttpExceptionFilter }];
+class HttpFoundation {
+  constructor(@Inject(HttpAdapterHost) host: HttpAdapterHost) {
+    // Install before Nest's JSON parser so malformed requests are also correlated.
+    host.httpAdapter?.use((request: { correlationId: string }, response: { setHeader(name: string, value: string): void }, next: () => void) => {
+      request.correlationId = randomUUID();
+      response.setHeader('x-correlation-id', request.correlationId);
+      next();
+    });
+  }
+}
+@Module({ providers: httpProviders })
+class RegisteredHttpApplication extends HttpFoundation {}
 
-@Module({ imports: [WalletsModule.register()] })
-export class AppModule {
-  static register(options: { uow: FinancialUnitOfWork }): DynamicModule {
-    return { module: RegisteredHttpApplication, imports: [WalletsModule.register(options)] };
+@Module({ imports: httpModules(), providers: httpProviders })
+export class AppModule extends HttpFoundation {
+  static register(options: { uow: FinancialUnitOfWork }) {
+    return { module: RegisteredHttpApplication, imports: httpModules(options.uow) };
   }
 }
