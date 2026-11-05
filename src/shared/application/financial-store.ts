@@ -1,3 +1,4 @@
+import type { WorkerStore } from './worker-store';
 import type { Wallet } from '../../modules/wallets/domain/wallet';
 import type { WalletLedgerEntry } from '../../modules/wallets/domain/wallet-ledger-entry';
 import type { WagerTransaction } from '../../modules/wagering/domain/wager-transaction';
@@ -6,7 +7,7 @@ import type { OutboxMessage } from '../../modules/messaging/domain/outbox-messag
 
 export interface LedgerPosition { readonly createdAt: string; readonly id: string }
 export interface LedgerPageItem { readonly entry: WalletLedgerEntry; readonly position: LedgerPosition }
-export interface FinancialStore {
+export interface FinancialStore extends WorkerStore {
   getWallet(id: string, lock?: boolean): Promise<Wallet | undefined>;
   insertWallet(wallet: Wallet): Promise<void>;
   updateWallet(wallet: Wallet): Promise<void>;

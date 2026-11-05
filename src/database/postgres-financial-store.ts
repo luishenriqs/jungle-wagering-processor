@@ -1,13 +1,16 @@
+import { dateCopy, requireText } from '../shared/domain/validation';
+import { internalId } from '../shared/application/identifiers';
+import { InvalidDomainInputError } from '../shared/domain/domain-errors';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import type { FinancialStore, LedgerPosition } from '../shared/application/financial-store';
 import type { Wallet } from '../modules/wallets/domain/wallet';
 import type { WagerTransaction } from '../modules/wagering/domain/wager-transaction';
 import type { WalletLedgerEntry } from '../modules/wallets/domain/wallet-ledger-entry';
-import type { OutboxMessage } from '../modules/messaging/domain/outbox-message';
+import type { OutboxMessage, RetryPolicy } from '../modules/messaging/domain/outbox-message';
 import type { InboxMessage } from '../modules/messaging/domain/inbox-message';
 import { PersistenceInvariantError } from '../shared/application/application-errors';
-import { walletRecord, walletDomain, wagerRecord, wagerDomain, ledgerRecord, ledgerDomain, inboxDomain, outboxRecord } from './mappers';
-import type { WalletRecord, WagerRecord, LedgerRecord, InboxRecord, PostgresRow } from './records';
+import { walletRecord, walletDomain, wagerRecord, wagerDomain, ledgerRecord, ledgerDomain, inboxDomain, outboxRecord, outboxDomain } from './mappers';
+import type { WalletRecord, WagerRecord, LedgerRecord, InboxRecord, OutboxRecord, PostgresRow } from './records';
 
 /** All statements use the transactional SqlEntityManager, never an independent connection. */
 export class PostgresFinancialStore implements FinancialStore {
@@ -60,6 +63,66 @@ export class PostgresFinancialStore implements FinancialStore {
     if (!message.processedAt) throw new PersistenceInvariantError('Inbox must be processed before persistence');
     const rows = await this.em.execute<{ message_id: string }[]>('update inbox_messages set processed_at=? where consumer_name=? and message_id=? and payload_hash=? and processed_at is null returning message_id', [message.processedAt, message.consumerName, message.messageId, message.payloadHash]);
     if (rows.length !== 1) throw new PersistenceInvariantError('Inbox completion did not affect one row');
+  }
+  async findDuePendingWagers(now: Date, limit: number): Promise<WagerTransaction[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new InvalidDomainInputError('Candidate limit must be 1..1000');
+    const at = dateCopy(now);
+    // Discovery never locks a wager before its Wallet. Expiration is independently due.
+    const rows = await this.em.execute<PostgresRow<WagerRecord>[]>(`select t.* from wager_transactions t
+      where t.status='PENDING_REFERENCE' and (t.next_retry_at<=? or t.expires_at<=?)
+      order by case when exists (select 1 from wager_transactions r where r.provider_id=t.provider_id
+        and r.external_transaction_id=t.reference_external_transaction_id and r.status='PROCESSED') then 0 else 1 end,
+        t.next_retry_at,t.id limit ?`, [at, at, limit]);
+    return rows.map(wagerDomain);
+  }
+  async updatePendingWager(tx: WagerTransaction): Promise<boolean> {
+    if (!['PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED'].includes(tx.status)) {
+      throw new InvalidDomainInputError('Invalid worker wager transition');
+    }
+    const r = wagerRecord(tx);
+    // No identity/payload/created_at fields are mutable. Caller holds Wallet -> Wager locks.
+    const rows = await this.em.execute<{ id: string }[]>(`update wager_transactions set
+      status=?,reference_transaction_id=?,failure_code=?,recorded_balance_amount=?,recorded_balance_currency=?,
+      attempts=?,next_retry_at=?,expires_at=?,processed_at=? where id=? and status='PENDING_REFERENCE' returning id`,
+      [r.status, r.reference_transaction_id, r.failure_code, r.recorded_balance_amount, r.recorded_balance_currency,
+        r.attempts, r.next_retry_at, r.expires_at, r.processed_at, r.id]);
+    return rows.length === 1;
+  }
+  async claimNextOutbox(workerId: string, leaseToken: string, now: Date, leaseUntil: Date, retry?: RetryPolicy) {
+    requireText(workerId, 'workerId');
+    const token = internalId(leaseToken); const at = dateCopy(now); const until = dateCopy(leaseUntil);
+    if (until.getTime() <= at.getTime()) throw new InvalidDomainInputError('Lease must expire after claim time');
+    const rows = await this.em.execute<PostgresRow<OutboxRecord>[]>(`with candidate as (
+      select id from outbox_messages where published_at is null and next_attempt_at<=?
+        and (lease_until is null or lease_until<=?)
+      order by next_attempt_at,occurred_at,id limit 1 for update skip locked
+    ) update outbox_messages o set lease_owner=?,lease_token=?,lease_until=?
+      from candidate c where o.id=c.id returning o.*`, [at, at, workerId, token, until]);
+    const row = rows[0];
+    return row ? { message: outboxDomain(row, retry), workerId, leaseToken: token, leaseUntil: until } : undefined;
+  }
+  async completeOutbox(id: string, workerId: string, leaseToken: string, publishedAt: Date): Promise<boolean> {
+    requireText(workerId, 'workerId');
+    const at = dateCopy(publishedAt);
+    const rows = await this.em.execute<{ id: string }[]>(`update outbox_messages
+      set published_at=?,lease_owner=null,lease_token=null,lease_until=null,last_error=null
+      where id=? and published_at is null and lease_owner=? and lease_token=? and lease_until>? returning id`,
+      [at, internalId(id), workerId, internalId(leaseToken), at]);
+    return rows.length === 1;
+  }
+  async failOutbox(message: OutboxMessage, workerId: string, leaseToken: string, now: Date, lastError: string): Promise<boolean> {
+    requireText(workerId, 'workerId');
+    const at = dateCopy(now);
+    if (!message.isPending() || message.attempts < 1 || message.nextAttemptAt.getTime() <= at.getTime()) {
+      throw new InvalidDomainInputError('Outbox retry must already be scheduled');
+    }
+    if (!/^[A-Z0-9_.:-]{1,128}$/.test(lastError)) throw new InvalidDomainInputError('Expected safe diagnostic code');
+    const rows = await this.em.execute<{ id: string }[]>(`update outbox_messages
+      set attempts=?,next_attempt_at=?,last_error=?,lease_owner=null,lease_token=null,lease_until=null
+      where id=? and published_at is null and lease_owner=? and lease_token=? and lease_until>?
+        and attempts=? returning id`,
+      [message.attempts, message.nextAttemptAt, lastError, internalId(message.id), workerId, internalId(leaseToken), at, message.attempts - 1]);
+    return rows.length === 1;
   }
   async ledgerPage(walletId: string, limit: number, before?: LedgerPosition) {
     const rows = await this.em.execute<(PostgresRow<LedgerRecord> & { cursor_time: string })[]>(`select *,to_char(created_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as cursor_time from wallet_ledger_entries where wallet_id=? ${before ? 'and (created_at,id)<(?::timestamptz,?::uuid)' : ''} order by created_at desc,id desc limit ?`, [walletId, ...(before ? [before.createdAt, before.id] : []), limit]);

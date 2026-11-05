@@ -1,3 +1,4 @@
+import { initialReferenceSchedule, pendingReferencePolicy, validatePendingReferencePolicy, type PendingReferencePolicy } from './pending-reference-policy';
 import type { FinancialStore, FinancialUnitOfWork } from '../../../shared/application/financial-store';
 import { NotFoundError, PersistenceInvariantError, sqlError } from '../../../shared/application/application-errors';
 import { execution, exhausted, isTransient, retryDelay, type ExecutionOptions } from '../../../shared/application/execution';
@@ -17,6 +18,7 @@ import { WagerTransactionPendingReference } from '../domain/events/wager-transac
 import { FailureCode } from '../domain/failure-code';
 import { wagerPayloadHash, type WagerPayload } from './wager-payload';
 
+export interface ProcessWagerOptions extends ExecutionOptions { readonly pendingReferencePolicy?: PendingReferencePolicy }
 export interface ProcessWagerInput extends WagerPayload {
   readonly idempotencyKey: string;
   readonly correlationId: string;
@@ -33,7 +35,11 @@ export interface ProcessWagerResult {
 const BUSINESS_UNIQUES = new Set(['uq_wager_idempotency', 'uq_wager_provider_external']);
 export class ProcessWagerTransactionUseCase {
   private readonly runtime;
-  constructor(private readonly uow: FinancialUnitOfWork, options: ExecutionOptions = {}) { this.runtime = execution(options); }
+  private readonly referencePolicy: PendingReferencePolicy;
+  constructor(private readonly uow: FinancialUnitOfWork, options: ProcessWagerOptions = {}) {
+    this.runtime = execution(options);
+    this.referencePolicy = validatePendingReferencePolicy(options.pendingReferencePolicy ?? pendingReferencePolicy());
+  }
   async execute(input: ProcessWagerInput): Promise<ProcessWagerResult> {
     const normalized = { ...input, walletId: internalId(input.walletId), money: Money.from(input.money).toJSON() };
     requireText(input.correlationId, 'correlationId');
@@ -90,7 +96,7 @@ export class ProcessWagerTransactionUseCase {
             await this.runtime.checkpoint('wallet');
             tx.markProcessed(tx.expectsReference() ? reference?.id : undefined, at, wallet.balance);
           } else if (decision.status === 'REJECTED') tx.reject(decision.code, wallet.balance);
-          else tx.markPendingReference(wallet.balance, { nextRetryAt: new Date(at.getTime() + 1000), expiresAt: new Date(at.getTime() + 86400000) });
+          else tx.markPendingReference(wallet.balance, initialReferenceSchedule(at, this.referencePolicy));
           await store.insertWager(tx); await this.runtime.checkpoint('wager');
           if (entry) await store.appendLedger(entry);
           await this.runtime.checkpoint('ledger');

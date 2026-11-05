@@ -3,7 +3,7 @@ import { Wallet } from '../modules/wallets/domain/wallet';
 import { WalletLedgerEntry } from '../modules/wallets/domain/wallet-ledger-entry';
 import { WagerTransaction } from '../modules/wagering/domain/wager-transaction';
 import { InboxMessage } from '../modules/messaging/domain/inbox-message';
-import { OutboxMessage } from '../modules/messaging/domain/outbox-message';
+import { OutboxMessage, type RetryPolicy } from '../modules/messaging/domain/outbox-message';
 import type { WalletRecord, WagerRecord, LedgerRecord, InboxRecord, OutboxRecord, PostgresRow } from './records';
 import { databaseTimestamp, nullableDatabaseTimestamp } from './timestamps';
 
@@ -41,7 +41,7 @@ export const inboxDomain = (r: PostgresRow<InboxRecord>): InboxMessage => InboxM
 export const outboxRecord = (m: OutboxMessage): OutboxRecord => ({ id: m.id, aggregate_id: m.aggregateId, event_type: m.eventType,
   payload: m.payload, occurred_at: m.occurredAt, attempts: m.attempts, next_attempt_at: m.nextAttemptAt,
   lease_owner: null, lease_token: null, lease_until: null, published_at: m.publishedAt ?? null, last_error: null });
-export const outboxDomain = (r: PostgresRow<OutboxRecord>): OutboxMessage => OutboxMessage.rehydrate({ id: r.id, aggregateId: r.aggregate_id,
+export const outboxDomain = (r: PostgresRow<OutboxRecord>, retry?: RetryPolicy): OutboxMessage => OutboxMessage.rehydrate({ id: r.id, aggregateId: r.aggregate_id,
   eventType: r.event_type, payload: r.payload, occurredAt: databaseTimestamp(r.occurred_at, 'outbox_messages.occurred_at'), attempts: r.attempts,
   nextAttemptAt: databaseTimestamp(r.next_attempt_at, 'outbox_messages.next_attempt_at'),
-  publishedAt: nullableDatabaseTimestamp(r.published_at, 'outbox_messages.published_at') });
+  publishedAt: nullableDatabaseTimestamp(r.published_at, 'outbox_messages.published_at') }, retry);

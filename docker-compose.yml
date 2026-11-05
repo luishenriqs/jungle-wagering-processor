@@ -31,5 +31,21 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+  localstack:
+    image: localstack/localstack:4.10.0
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+    ports:
+      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      - ./docker/localstack/init:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wager-transactions.fifo >/dev/null && awslocal sqs get-queue-url --queue-name wager-transactions-dlq.fifo >/dev/null && awslocal sqs get-queue-url --queue-name wagering-events.fifo >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
 volumes:
   jungle_postgres_dev:
