@@ -4,6 +4,8 @@ Serviço financeiro distribuído do desafio Jungle Gaming: HTTP e SQS usam o mes
 
 Implementação IMP-01–IMP-04 concluída. A validação de observabilidade cobre tanto G6A (18 casos sem migrations, incluindo quatro composições NestJS reais) quanto G6B (dois casos com PostgreSQL em schemas exclusivos `jungle_it_<uuid>`). Resultados e limites estão em [FINAL-DELIVERY-EVIDENCE.md](FINAL-DELIVERY-EVIDENCE.md); decisões e arquitetura consolidada estão em [ARCHITECTURE.md](ARCHITECTURE.md); os relatórios [IMP-01-EVIDENCE.md](IMP-01-EVIDENCE.md), [IMP-02-EVIDENCE.md](IMP-02-EVIDENCE.md) e [IMP-03-EVIDENCE.md](IMP-03-EVIDENCE.md) preservam o histórico das etapas anteriores.
 
+FIX-D01/D02 acrescentam proteção PostgreSQL contra NaN e terminalização de overflow na resolução de referências. Validação consolidada: **1.243 testes aprovados, zero falhas e 8.253 asserções**. A evidência de validação e recuperação está em [FIX-D01-D02-FINAL-EVIDENCE.md](FIX-D01-D02-FINAL-EVIDENCE.md).
+
 ## Preparação
 
 Requer Bun **1.4.4**, Docker e Docker Compose. Dependências fixadas: TypeScript strict, NestJS 11.1.6, MikroORM 6.6.8, PostgreSQL 16.6, LocalStack 4.10.0 e decimal.js 10.6.0.
@@ -30,6 +32,8 @@ bun scripts/check-sqs.ts
 ```
 
 `db:migrate` aplica a migration versionada no destino de `DATABASE_URL`; confira essa URL antes de executar. Os processos da aplicação não aplicam migrations automaticamente. Desenvolvimento usa volume persistente; `postgres-test` usa tmpfs e porta 5434. Não execute migration manual em `public` de `jungle_test`: G6A exige esse schema vazio. Os testes que precisam de tabelas criam e removem seus próprios schemas `jungle_it_<uuid>`.
+
+A sequência inclui `Migration202611040001` e `Migration202611060001`. A segunda rejeita NaN explicitamente nas seis colunas monetárias de wallet, wager e ledger, validando também dados existentes. Se houver corrupção legada, a migration falha sem corrigir ou excluir histórico financeiro. Seu DOWN remove somente os três CHECKs novos e reabre essa proteção; o procedimento está na evidência FIX-D01.
 
 ## Execução
 
@@ -86,6 +90,8 @@ curl -sS http://127.0.0.1:3000/wagering/transactions \
 ```
 
 Valores monetários são strings com duas casas. BET debita, WIN credita, LOSS não movimenta saldo, REFUND/ROLLBACK exigem referência. `OPENING` e provider `SYSTEM` são internos. Resultado processado retorna 200, referência pendente 202, rejeição de negócio 422, conflito de identidade/payload 409. Replay preserva o snapshot persistido; não executa novo movimento. Erros de contrato retornam 400 e indisponibilidade transitória esgotada retorna 503.
+
+Se o movimento calculado durante a resolução de uma referência exceder NUMERIC(18,2), a operação termina como `FAILED` com `INFRASTRUCTURE_PERMANENT`, sem alterar saldo, versão ou ledger e sem criar eventos financeiros. A agenda de retry é encerrada. A mesma identidade continua devolvendo o resultado histórico, inclusive após reinício; o replay HTTP de FAILED retorna 422.
 
 A autenticação foi deliberadamente deixada como extensão aceita pelo desafio: `ProviderIdentityGuard` é no-op. O desenho de integração futura com IdP está em ARCHITECTURE.md. A aplicação local não deve ser tratada como API autenticada.
 

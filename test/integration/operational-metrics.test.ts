@@ -55,7 +55,8 @@ async function checkedHarness() {
     const schema = em.config.get('schema');
     if (typeof schema !== 'string' || !/^jungle_it_[a-f0-9]{32}$/.test(schema)) throw new Error('Refusing unexpected RED migration schema');
     const migrations = em.config.get('migrations').migrationsList;
-    if (migrations?.length !== 1 || migrations[0] !== (await import('../../src/database/migrations/Migration202611040001')).Migration202611040001) {
+    if (migrations?.length !== 2 || migrations[0] !== (await import('../../src/database/migrations/Migration202611040001')).Migration202611040001
+      || migrations[1] !== (await import('../../src/database/migrations/Migration202611060001')).Migration202611060001) {
       throw new Error('Refusing unexpected RED migration inventory');
     }
     const [target] = await em.getConnection().execute<Array<{ database: string; schema: string; search_path: string }>>(

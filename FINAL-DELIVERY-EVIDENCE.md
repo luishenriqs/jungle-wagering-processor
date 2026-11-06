@@ -1,5 +1,7 @@
 # FINAL-DELIVERY-01 / FINAL-DELIVERY-REV-FIX-01 — Evidência de entrega
 
+Atualização FIX-D01-D02-FINAL: **991 unitários + 252 integrações; 1.243 testes aprovados na execução conjunta, zero falhas e 8.253 asserções; typecheck aprovado**. As correções e os complementos de recuperação estão consolidados em [FIX-D01-D02-FINAL-EVIDENCE.md](FIX-D01-D02-FINAL-EVIDENCE.md). Os resultados abaixo registram a entrega anterior e não são somados à validação atual.
+
 Data: 06/11/2026. Executores: Codex e Antigravity. Luís Henrique Pereira autorizou validação, correções `REV-FINAL-01..03`, staging explícito, commit e publicação. Base auditada: `main`, HEAD inicial em `c4e7527f9e84d8269b218ee8791303f4c3aa0a38`.
 
 ## Resultados verificados

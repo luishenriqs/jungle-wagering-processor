@@ -3,6 +3,7 @@ import type { ClockPort } from '../../../shared/application/clock';
 import { PersistenceInvariantError, sqlError } from '../../../shared/application/application-errors';
 import { execution, exhausted, isTransient, retryDelay, type ExecutionOptions } from '../../../shared/application/execution';
 import { internalId } from '../../../shared/application/identifiers';
+import { MoneyOverflowError } from '../../../shared/domain/domain-errors';
 import { dateCopy } from '../../../shared/domain/validation';
 import { OutboxMessage } from '../../messaging/domain/outbox-message';
 import { LedgerDirection, type WalletLedgerEntry } from '../../wallets/domain/wallet-ledger-entry';
@@ -17,7 +18,7 @@ import { operationalEmitter, type OperationalLoggingOptions } from '../../../sha
 import { operationalMetricsEmitter, type OperationalMetricsOptions } from '../../../shared/application/operational-metrics';
 
 export interface PendingCandidate { readonly id: string; readonly walletId: string }
-export interface PendingResolution { readonly transactionId: string; readonly action: 'processed' | 'rejected' | 'rescheduled' | 'noop' | 'retry' }
+export interface PendingResolution { readonly transactionId: string; readonly action: 'processed' | 'rejected' | 'failed' | 'rescheduled' | 'noop' | 'retry' }
 export interface PendingWorkerOptions extends Omit<ExecutionOptions, 'now'>, OperationalLoggingOptions, OperationalMetricsOptions {
   readonly diagnose?: (event: { readonly component: 'pending-reference-worker'; readonly code: string; readonly transactionId?: string }) => void;
 }
@@ -91,8 +92,16 @@ export class PendingReferenceWorker {
           if (decision.status === 'PROCESSED') {
             if (decision.direction) {
               const movement = { transactionId: tx.id, ledgerEntryId: this.runtime.newId(), money: tx.money, at: now };
-              entry = decision.direction === LedgerDirection.Debit
-                ? wallet.debit({ ...movement, insufficientFundsCode: FailureCode.InsufficientFundsReversal }) : wallet.credit(movement);
+              try {
+                entry = decision.direction === LedgerDirection.Debit
+                  ? wallet.debit({ ...movement, insufficientFundsCode: FailureCode.InsufficientFundsReversal }) : wallet.credit(movement);
+              } catch (error) {
+                if (!(error instanceof MoneyOverflowError)) throw error;
+                tx.fail(FailureCode.InfrastructurePermanent, wallet.balance);
+                if (!await store.updatePendingWager(tx)) throw new PersistenceInvariantError('Pending transition did not affect one row');
+                await this.runtime.checkpoint('wager'); await this.runtime.checkpoint('beforeCommit');
+                return { transactionId, action: 'failed' };
+              }
               await store.updateWallet(wallet);
             }
             await this.runtime.checkpoint('wallet');
@@ -112,10 +121,12 @@ export class PendingReferenceWorker {
         });
         if (result.action !== 'noop') this.observe({ component: 'pending-reference-worker',
           event: result.action === 'rescheduled' ? 'pending_reference_rescheduled' : 'pending_reference_resolved',
-          transactionId, walletId, status: result.action });
+          transactionId, walletId, status: result.action === 'failed' ? WagerTransactionStatus.Failed : result.action,
+          ...(result.action === 'failed' ? { code: FailureCode.InfrastructurePermanent } : {}) });
         if (result.action === 'processed' || result.action === 'rejected' || result.action === 'rescheduled') {
           this.emitMetric({ type: 'pending-reference-resolution', action: result.action });
         }
+        if (result.action === 'failed') this.log('MONEY_OVERFLOW', transactionId);
         return result;
       } catch (error) {
         if (!isTransient(error)) throw error;

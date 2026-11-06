@@ -10,6 +10,7 @@ import { ProcessWagerTransactionUseCase } from '../../src/modules/wagering/appli
 import type { FinancialStore, FinancialUnitOfWork } from '../../src/shared/application/financial-store';
 import type { OutboxMessage } from '../../src/modules/messaging/domain/outbox-message';
 import { PersistenceInvariantError } from '../../src/shared/application/application-errors';
+import type { OperationalRecord } from '../../src/shared/application/operational-logging';
 
 const at = new Date('2035-01-01T00:00:00Z'); const money = (amount: string) => Money.from({ amount, currency: 'BRL' });
 function harness() {
@@ -145,4 +146,133 @@ test('inconsistent discovery candidate never locks the wager owned by another wa
   const h = harness(); h.setTx({ walletId: randomUUID() });
   await expect(h.worker.resolve(h.candidate)).rejects.toBeInstanceOf(PersistenceInvariantError);
   expect(h.calls).not.toContain('wager-lock'); expect(h.calls).not.toContain('commit');
+});
+
+test('D02 credit overflow on late reference terminalizes as FAILED without partial credit, Outbox or infinite retry while healthy candidates progress', async () => {
+  const maxWallet = Wallet.rehydrate({ id: randomUUID(), playerId: 'player-test-01', currency: 'BRL',
+    balance: money('9999999999999999.99'), version: 3, createdAt: at, updatedAt: at });
+  const healthyWallet = Wallet.rehydrate({ id: randomUUID(), playerId: 'player-test-02', currency: 'BRL',
+    balance: money('90.00'), version: 2, createdAt: at, updatedAt: at });
+  const winId = randomUUID(); const betId = randomUUID();
+  const refundId = randomUUID(); const healthyBetId = randomUUID();
+  let win = WagerTransaction.rehydrate({ id: winId, walletId: maxWallet.id, playerId: maxWallet.playerId,
+    providerId: 'provider', externalTransactionId: 'win-overflow', idempotencyKey: 'win-overflow-key',
+    payloadHash: 'a'.repeat(64), roundId: 'round-max', gameId: 'game', kind: WagerTransactionKind.Win,
+    money: money('20.00'), referenceExternalTransactionId: 'bet-max', createdAt: at,
+    status: WagerTransactionStatus.PendingReference, attempts: 0,
+    nextRetryAt: new Date(at.getTime() + 1000), expiresAt: new Date(at.getTime() + 86400000),
+    recordedBalance: money('9999999999999990.00') });
+  const bet = WagerTransaction.rehydrate({ id: betId, walletId: maxWallet.id, playerId: maxWallet.playerId,
+    providerId: 'provider', externalTransactionId: 'bet-max', idempotencyKey: 'bet-max-key',
+    payloadHash: 'b'.repeat(64), roundId: 'round-max', gameId: 'game', kind: WagerTransactionKind.Bet,
+    money: money('10.00'), createdAt: at, status: WagerTransactionStatus.Processed,
+    processedAt: at, recordedBalance: money('9999999999999980.00') });
+  let refund = WagerTransaction.rehydrate({ id: refundId, walletId: healthyWallet.id, playerId: healthyWallet.playerId,
+    providerId: 'provider', externalTransactionId: 'refund-healthy', idempotencyKey: 'refund-healthy-key',
+    payloadHash: 'c'.repeat(64), roundId: 'round-healthy', gameId: 'game', kind: WagerTransactionKind.Refund,
+    money: money('10.00'), referenceExternalTransactionId: 'bet-healthy', createdAt: at,
+    status: WagerTransactionStatus.PendingReference, attempts: 0,
+    nextRetryAt: new Date(at.getTime() + 1000), expiresAt: new Date(at.getTime() + 86400000),
+    recordedBalance: money('90.00') });
+  const healthyBet = WagerTransaction.rehydrate({ id: healthyBetId, walletId: healthyWallet.id, playerId: healthyWallet.playerId,
+    providerId: 'provider', externalTransactionId: 'bet-healthy', idempotencyKey: 'bet-healthy-key',
+    payloadHash: 'd'.repeat(64), roundId: 'round-healthy', gameId: 'game', kind: WagerTransactionKind.Bet,
+    money: money('10.00'), createdAt: at, status: WagerTransactionStatus.Processed,
+    processedAt: at, recordedBalance: money('90.00') });
+  const now = new Date(at.getTime() + 1000);
+  const calls: string[] = []; const events: OutboxMessage[] = [];
+  const logs: OperationalRecord[] = []; const diagnostics: unknown[] = [];
+  const store: Partial<FinancialStore> = {
+    findDuePendingWagers: async () => [win, refund].filter(tx => tx.status === WagerTransactionStatus.PendingReference),
+    getWallet: async (id, lock) => {
+      expect(lock).toBe(true);
+      if (id === maxWallet.id) return maxWallet;
+      if (id === healthyWallet.id) return healthyWallet;
+      return undefined;
+    },
+    getWager: async id => {
+      if (id === win.id) return win;
+      if (id === bet.id) return bet;
+      if (id === refund.id) return refund;
+      if (id === healthyBet.id) return healthyBet;
+      return undefined;
+    },
+    findWager: async (_providerId, externalId) => {
+      if (externalId === 'bet-max') return bet;
+      if (externalId === 'bet-healthy') return healthyBet;
+      return undefined;
+    },
+    isReversed: async () => false,
+    updateWallet: async updated => { calls.push(`wallet-write:${updated.id}`); },
+    updatePendingWager: async updated => {
+      calls.push(`wager-write:${updated.id}:${updated.status}`);
+      if (updated.id === win.id) win = updated;
+      if (updated.id === refund.id) refund = updated;
+      return true;
+    },
+    appendLedger: async entry => { calls.push(`ledger:${entry.transactionId}`); },
+    enqueue: async event => { events.push(event); },
+  };
+  const uow: FinancialUnitOfWork = { run: async work => work(store as FinancialStore) };
+  const worker = new PendingReferenceWorker(uow, { now: () => now }, pendingReferencePolicy({}), {
+    diagnose: event => diagnostics.push(event),
+    operationalLog: record => { logs.push(record); },
+  });
+  expect(await worker.runOnce()).toEqual([
+    { transactionId: win.id, action: 'failed' },
+    { transactionId: refund.id, action: 'processed' },
+  ]);
+  expect(win.status).toBe(WagerTransactionStatus.Failed);
+  expect(win.failureCode).toBe(FailureCode.InfrastructurePermanent);
+  expect(win.recordedBalance?.toString()).toBe('9999999999999999.99');
+  expect(win.nextRetryAt).toBeUndefined();
+  expect(win.expiresAt).toBeUndefined();
+  expect(maxWallet.balance.toString()).toBe('9999999999999999.99');
+  expect(maxWallet.version).toBe(3);
+  expect(calls).not.toContain(`wallet-write:${maxWallet.id}`);
+  expect(calls).not.toContain(`ledger:${win.id}`);
+  expect(healthyWallet.balance.toString()).toBe('100.00');
+  expect(healthyWallet.version).toBe(3);
+  expect(refund.status).toBe(WagerTransactionStatus.Processed);
+  expect(events.map(e => e.aggregateId)).toEqual([healthyWallet.id, healthyWallet.id]);
+  expect(logs).toHaveLength(2);
+  expect(logs[0]).toMatchObject({ component: 'pending-reference-worker', event: 'pending_reference_resolved',
+    transactionId: win.id, walletId: maxWallet.id, status: 'FAILED', code: 'INFRASTRUCTURE_PERMANENT' });
+  expect(diagnostics).toEqual([{ component: 'pending-reference-worker', code: 'MONEY_OVERFLOW', transactionId: win.id }]);
+  expect(await worker.runOnce()).toEqual([]);
+  expect(await worker.resolve({ id: win.id, walletId: maxWallet.id })).toEqual({ transactionId: win.id, action: 'noop' });
+});
+
+test('D02 credit overflow after TTL or on last attempt still terminalizes as FAILED (never REFERENCE_NOT_FOUND_TIMEOUT) and aborts if update fails', async () => {
+  for (const mode of ['last-attempt', 'after-ttl', 'zero-row-abort'] as const) {
+    const h = harness();
+    const maxWallet = Wallet.rehydrate({ id: h.wallet.id, playerId: h.wallet.playerId, currency: 'BRL',
+      balance: money('9999999999999999.99'), version: 3, createdAt: at, updatedAt: at });
+    h.store.getWallet = async () => maxWallet;
+    h.setTx({
+      kind: WagerTransactionKind.Win,
+      money: money('20.00'),
+      attempts: mode === 'last-attempt' ? 9 : 0,
+      recordedBalance: money('9999999999999990.00'),
+    });
+    if (mode === 'after-ttl') h.setNow(h.state.expiresAt!);
+    if (mode === 'zero-row-abort') h.store.updatePendingWager = async () => false;
+    const logs: OperationalRecord[] = []; const diagnostics: unknown[] = [];
+    const worker = new PendingReferenceWorker(h.uow, { now: () => mode === 'after-ttl' ? h.state.expiresAt! : new Date(at.getTime() + 1000) },
+      pendingReferencePolicy({}), { diagnose: event => diagnostics.push(event), operationalLog: record => { logs.push(record); } });
+    if (mode === 'zero-row-abort') {
+      await expect(worker.resolve(h.candidate)).rejects.toBeInstanceOf(PersistenceInvariantError);
+      expect(logs).toEqual([]);
+      expect(diagnostics).toEqual([]);
+      expect(h.events).toEqual([]);
+    } else {
+      expect(await worker.resolve(h.candidate)).toEqual({ transactionId: h.candidate.id, action: 'failed' });
+      expect(h.tx().status).toBe(WagerTransactionStatus.Failed);
+      expect(h.tx().failureCode).toBe(FailureCode.InfrastructurePermanent);
+      expect(h.tx().recordedBalance?.toString()).toBe('9999999999999999.99');
+      expect(h.events).toEqual([]);
+      expect(logs).toHaveLength(1);
+      expect(diagnostics).toEqual([{ component: 'pending-reference-worker', code: 'MONEY_OVERFLOW', transactionId: h.candidate.id }]);
+    }
+  }
 });
