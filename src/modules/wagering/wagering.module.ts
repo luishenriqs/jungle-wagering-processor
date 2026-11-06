@@ -9,6 +9,7 @@ import { PendingReferenceWorker } from './application/pending-reference-worker';
 import { PendingReferenceLifecycle } from './infrastructure/pending-reference-lifecycle';
 import { stderrOperationalLog } from '../../shared/infrastructure/structured-logger';
 import { OPERATIONAL_METRICS, type OperationalMetricsCollector } from '../../shared/application/operational-metrics';
+import { WorkerMetricsReporter } from '../../shared/infrastructure/worker-metrics-reporter';
 
 interface StandaloneMetricsOptions { readonly metrics?: OperationalMetricsCollector | undefined }
 
@@ -35,6 +36,8 @@ export class WageringModule {
           new PendingReferenceWorker(uow, clock, policy, { operationalLog: stderrOperationalLog, operationalMetrics: metrics }) },
       { provide: PendingReferenceLifecycle, inject: [PendingReferenceWorker, LOOP],
         useFactory: (worker: PendingReferenceWorker, loop: { pollMs: number; batchSize: number }) => new PendingReferenceLifecycle(worker, loop.pollMs, loop.batchSize) },
+      { provide: WorkerMetricsReporter, inject: [OPERATIONAL_METRICS],
+        useFactory: (metrics: OperationalMetricsCollector) => new WorkerMetricsReporter(metrics, 'pending-reference-worker') },
     ], exports: [PendingReferenceWorker] };
   }
 }

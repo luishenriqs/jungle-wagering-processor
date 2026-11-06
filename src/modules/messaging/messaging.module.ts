@@ -16,6 +16,7 @@ import { ConsumerLifecycle } from './infrastructure/consumer-lifecycle';
 import type { SQSClient } from '@aws-sdk/client-sqs';
 import { stderrOperationalLog } from '../../shared/infrastructure/structured-logger';
 import { OPERATIONAL_METRICS, type OperationalMetricsCollector } from '../../shared/application/operational-metrics';
+import { WorkerMetricsReporter } from '../../shared/infrastructure/worker-metrics-reporter';
 
 interface StandaloneMetricsOptions { readonly metrics?: OperationalMetricsCollector | undefined }
 
@@ -38,6 +39,8 @@ export class MessagingModule {
           new SqsWagerConsumer(processor, transport, clock, config, undefined, { operationalLog: stderrOperationalLog, operationalMetrics: metrics }) },
       { provide: ConsumerLifecycle, inject: [SqsWagerConsumer, SQS_CLIENT],
         useFactory: (consumer: SqsWagerConsumer, client: SQSClient) => new ConsumerLifecycle(consumer, client) },
+      { provide: WorkerMetricsReporter, inject: [OPERATIONAL_METRICS],
+        useFactory: (metrics: OperationalMetricsCollector) => new WorkerMetricsReporter(metrics, 'sqs-consumer') },
     ], exports: [SqsWagerConsumer] };
   }
   /** Publisher is independently deployable; the consumer and HTTP modules remain unchanged. */
@@ -62,6 +65,8 @@ export class MessagingModule {
           new OutboxPublisher(uow, transport, clock, config, { workerId: process.env['OUTBOX_WORKER_ID'] ?? `outbox-${process.pid}-${randomUUID()}`, operationalLog: stderrOperationalLog, operationalMetrics: metrics }) },
       { provide: PublisherLifecycle, inject: [OutboxPublisher, SQS_CLIENT, POLL],
         useFactory: (publisher: OutboxPublisher, client: SQSClient, pollMs: number) => new PublisherLifecycle(publisher, client, pollMs) },
+      { provide: WorkerMetricsReporter, inject: [OPERATIONAL_METRICS],
+        useFactory: (metrics: OperationalMetricsCollector) => new WorkerMetricsReporter(metrics, 'outbox-publisher') },
     ], exports: [OutboxPublisher] };
   }
 

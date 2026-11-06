@@ -57,7 +57,8 @@ In distributed iGaming environments, provider messages arrive under **at-least-o
 
 All implementation packages (`IMP-01` through `IMP-04`) and post-audit hardening packages (`FIX-D01`, `FIX-D02`, and `AUDIT-D03-FIX-01`) are complete and verified:
 
-- **Consolidated Test Suite:** **1,247 passing tests** (`994` unit tests across `27` files + `253` integration tests across `15` files), **0 failures**, and **8,347 assertions**, plus `bun run typecheck` (`tsc --noEmit`).
+- **Consolidated Test Suite:** **1,274 passing tests** (`1,006` unit tests across `28` files + `268` integration tests across `16` files), **0 failures**, and **8,572 assertions**, plus `bun run typecheck` (`tsc --noEmit`).
+- **Worker Metrics Export Evidence (`D04`):** [`AUDIT-D04-FIX-01-EVIDENCE.md`](AUDIT-D04-FIX-01-EVIDENCE.md)
 - **Architecture & Design Decisions:** [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - **Consolidated Delivery Evidence (`FIX-D01` + `FIX-D02`):** [`FIX-D01-D02-FINAL-EVIDENCE.md`](FIX-D01-D02-FINAL-EVIDENCE.md)
 - **PostgreSQL Monetary Finiteness Evidence (`FIX-D01`):** [`FIX-D01-EVIDENCE.md`](FIX-D01-EVIDENCE.md)
@@ -150,6 +151,7 @@ scripts/
 | `PENDING_REF_POLL_INTERVAL_MS` | `250` | Polling interval for `PendingReferenceWorker` |
 | `PENDING_REF_BATCH_SIZE` | `100` | Maximum due candidates discovered per `PendingReferenceWorker` scan |
 | `HEALTH_READINESS_TIMEOUT_MS` | `1500` | Timeout (`100..10000` ms) for `/health/ready` dependency probes |
+| `WORKER_METRICS_INTERVAL_MS` | `10000` | Worker NDJSON snapshot interval in ms (`50..3600000`) |
 | `WORKER_SHUTDOWN_TIMEOUT_MS` | `60000` | Watchdog deadline (`1..300000` ms) covering worker drain and resource disposal |
 
 ---
@@ -426,13 +428,13 @@ All non-2xx errors thrown through [`HttpExceptionFilter`](src/shared/infrastruct
 # Static type checking (TypeScript 5.9.3 strict mode)
 bun run typecheck
 
-# Unit tests only (994 tests across 27 files; no Docker containers required)
+# Unit tests only (1,006 tests across 28 files; no Docker containers required)
 bun run test:unit
 
-# Integration tests only (253 tests across 15 files; requires postgres-test on 5434 and LocalStack on 4566)
+# Integration tests only (268 tests across 16 files; requires postgres-test on 5434 and LocalStack on 4566)
 bun run test:integration
 
-# Full test suite (1,247 tests across 42 files; 8,347 assertions)
+# Full test suite (1,274 tests across 44 files; 8,572 assertions)
 bun test
 
 # Check working tree for whitespace or conflict markers
@@ -441,7 +443,7 @@ git diff --check
 
 #### Test Categories and Coverage
 
-1. **Unit Tests (`test/unit/*.test.ts` — 994 tests, 27 files):**
+1. **Unit Tests (`test/unit/*.test.ts` — 1,006 tests, 28 files):**
    - `Money` precision, scale validation, currency mismatch rejection, and `NUMERIC(18,2)` overflow bounds.
    - `Wallet` opening, debit/credit transitions, version increments, and `WalletLedgerEntry` balance arithmetic.
    - `WagerTransaction` state machine transitions, `evaluateWager` business rules for `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK`, chained reversals, and canonical payload hashing.
@@ -498,6 +500,26 @@ Exposes a deep-frozen JSON snapshot (`scope: "process"`) maintained by [`Default
 - `reconciliation`: `{ divergences }`.
 - `pendingReference`: `{ processed, rejected, rescheduled }`.
 
+#### Standalone Worker Metrics (NDJSON on stderr)
+
+Each standalone consumer, Outbox publisher and pending-reference worker exports its **own existing collector** as one JSON object per line on `stderr`. Filter records by `type: "OperationalMetricsSnapshot"`; operational event logs continue to share the stream. The envelope is:
+
+```ts
+type WorkerMetricsEnvelope = {
+  type: 'OperationalMetricsSnapshot',
+  version: 1,
+  component: 'sqs-consumer' | 'outbox-publisher' | 'pending-reference-worker',
+  executionId: string, // fresh UUID for this reporter execution
+  pid: number,
+  timestamp: string,   // ISO-8601 UTC sampling time
+  snapshot: OperationalMetricsSnapshot // complete existing process-scoped JSON contract above
+}
+```
+
+`WORKER_METRICS_INTERVAL_MS` defaults to `10000` ms (allowed range `50..3600000`). A snapshot is attempted after worker composition succeeds, then periodically and best-effort on graceful shutdown. Identical successfully written snapshots are skipped. Counters are cumulative observations since that process/context started; they reset on restart and are **not** a census of current database rows. Use `executionId` to distinguish resets, and compute deltas instead of summing successive cumulative snapshots.
+
+The reporter permits at most one pending write and retains no sample queue. While that write is pending, new samples are skipped before reading the collector. Exceptions and rejected writes are contained; a write that never settles suppresses further samples from that reporter without blocking financial work or shutdown. A later successful sample includes the collector's accumulated counters, but intermediate exported records can be lost. Delivery is best-effort, with no persistence or cross-process aggregation. `GET /metrics` continues to expose **only the serving HTTP process**.
+
 #### Health and Readiness Checks
 
 - `GET /health/live`: Confirms the HTTP event loop is responsive (`200 OK`).
@@ -516,7 +538,7 @@ Exposes a deep-frozen JSON snapshot (`scope: "process"`) maintained by [`Default
 #### Known Operational Limitations
 
 1. **Authentication Not Implemented (By Design):** `ProviderIdentityGuard` is a no-op extension point as permitted by the challenge specification; external OIDC/JWKS validation must be enabled before exposing HTTP endpoints to untrusted networks.
-2. **Process-Local Volatile Metrics:** `GET /metrics` reports in-memory metrics for the serving HTTP process (`scope: "process"`). Standalone worker processes (`consume-wagers.ts`, `publish-outbox.ts`, `resolve-pending-references.ts`) maintain their own in-process collectors and do not push to an external time-series aggregator (e.g., Prometheus/OpenTelemetry) in this delivery.
+2. **Process-Local Volatile Metrics:** `GET /metrics` reports in-memory metrics for the serving HTTP process (`scope: "process"`). Standalone worker processes (`consume-wagers.ts`, `publish-outbox.ts`, `resolve-pending-references.ts`) export their own in-process collectors as NDJSON on stderr; no external time-series aggregator or persistent metrics store is provided.
 3. **At-Least-Once Outbox Delivery:** `OutboxPublisher` guarantees at-least-once publication to `wagering-events.fifo`. Downstream consumers must deduplicate integration events by `eventId`.
 4. **Mixed DLQ Message Envelopes:** `wager-transactions-dlq.fifo` may receive either sanitized `WagerTransactionDeadLetter` diagnostic envelopes (for permanent contract errors) or original `WagerTransactionRequested` payloads (via native SQS `RedrivePolicy` after `maxReceiveCount` transient/unknown failures). Operators must inspect message `type` before replaying DLQ items and never replay a diagnostic envelope as a financial command.
 5. **TypeScript `skipLibCheck`:** Following Bun's official TypeScript configuration guidance, `skipLibCheck: true` is enabled in `tsconfig.json` to avoid transitive declaration conflicts between `@types/bun` and `@types/node`, while full strict checking (`strict: true`, `exactOptionalPropertyTypes: true`, `noUncheckedIndexedAccess: true`) is enforced across all project source, script, and test files.
@@ -576,7 +598,8 @@ Em ambientes distribuídos de iGaming, mensagens de provedores são entregues so
 
 Todos os pacotes de implementação (`IMP-01` a `IMP-04`) e as correções pós-auditoria (`FIX-D01`, `FIX-D02` e `AUDIT-D03-FIX-01`) estão concluídos e verificados:
 
-- **Suíte Consolidada de Testes:** **1.247 testes aprovados** (`994` unitários em `27` arquivos + `253` de integração em `15` arquivos), **0 falhas** e **8.347 asserções**, além de `bun run typecheck` (`tsc --noEmit`).
+- **Suíte Consolidada de Testes:** **1.274 testes aprovados** (`1.006` unitários em `28` arquivos + `268` de integração em `16` arquivos), **0 falhas** e **8.572 asserções**, além de `bun run typecheck` (`tsc --noEmit`).
+- **Evidência de Exportação de Métricas (`D04`):** [`AUDIT-D04-FIX-01-EVIDENCE.md`](AUDIT-D04-FIX-01-EVIDENCE.md)
 - **Arquitetura e Decisões Técnicas:** [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - **Evidência Consolidada da Entrega (`FIX-D01` + `FIX-D02`):** [`FIX-D01-D02-FINAL-EVIDENCE.md`](FIX-D01-D02-FINAL-EVIDENCE.md)
 - **Evidência de Finitude Monetária no PostgreSQL (`FIX-D01`):** [`FIX-D01-EVIDENCE.md`](FIX-D01-EVIDENCE.md)
@@ -669,6 +692,7 @@ scripts/
 | `PENDING_REF_POLL_INTERVAL_MS` | `250` | Intervalo de polling do `PendingReferenceWorker` |
 | `PENDING_REF_BATCH_SIZE` | `100` | Limite de candidatos vencidos lidos por varredura do `PendingReferenceWorker` |
 | `HEALTH_READINESS_TIMEOUT_MS` | `1500` | Timeout (`100..10000` ms) das sondas de dependências em `/health/ready` |
+| `WORKER_METRICS_INTERVAL_MS` | `10000` | Intervalo de snapshots NDJSON dos workers em ms (`50..3600000`) |
 | `WORKER_SHUTDOWN_TIMEOUT_MS` | `60000` | Prazo do watchdog (`1..300000` ms) cobrindo drenagem e fechamento de recursos dos workers |
 
 ---
@@ -945,13 +969,13 @@ Todos os erros não-2xx tratados pelo [`HttpExceptionFilter`](src/shared/infrast
 # Verificação estática de tipos (TypeScript 5.9.3 modo estrito)
 bun run typecheck
 
-# Apenas testes unitários (994 testes em 27 arquivos; não requer containers Docker)
+# Apenas testes unitários (1.006 testes em 28 arquivos; não requer containers Docker)
 bun run test:unit
 
-# Apenas testes de integração (253 testes em 15 arquivos; requer postgres-test na 5434 e LocalStack na 4566)
+# Apenas testes de integração (268 testes em 16 arquivos; requer postgres-test na 5434 e LocalStack na 4566)
 bun run test:integration
 
-# Suíte completa (1.247 testes em 42 arquivos; 8.347 asserções)
+# Suíte completa (1.274 testes em 44 arquivos; 8.572 asserções)
 bun test
 
 # Verificação de formatação do diff e marcadores de conflito
@@ -960,7 +984,7 @@ git diff --check
 
 #### Categorias de Testes e Cobertura
 
-1. **Testes Unitários (`test/unit/*.test.ts` — 994 testes, 27 arquivos):**
+1. **Testes Unitários (`test/unit/*.test.ts` — 1.006 testes, 28 arquivos):**
    - Precisão de `Money`, validação de escala, rejeição de moedas divergentes e limites de overflow `NUMERIC(18,2)`.
    - Abertura de `Wallet`, transições de débito/crédito, incremento de versão e aritmética de `WalletLedgerEntry`.
    - Máquina de estados de `WagerTransaction`, regras de negócio `evaluateWager` para `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK`, reversões encadeadas e hash canônico de payload.
@@ -1017,6 +1041,26 @@ Expõe um snapshot JSON imutável (`scope: "process"`) mantido pelo [`DefaultOpe
 - `reconciliation`: `{ divergences }`.
 - `pendingReference`: `{ processed, rejected, rescheduled }`.
 
+#### Métricas dos Workers Standalone (NDJSON em stderr)
+
+Cada consumidor, publisher de Outbox e worker de referências pendentes exporta **seu próprio coletor existente** como um objeto JSON por linha em `stderr`. Filtre registros por `type: "OperationalMetricsSnapshot"`; os logs operacionais continuam compartilhando o stream. O envelope é:
+
+```ts
+type WorkerMetricsEnvelope = {
+  type: 'OperationalMetricsSnapshot',
+  version: 1,
+  component: 'sqs-consumer' | 'outbox-publisher' | 'pending-reference-worker',
+  executionId: string, // UUID novo para esta execução do reporter
+  pid: number,
+  timestamp: string,   // instante da amostragem em ISO-8601 UTC
+  snapshot: OperationalMetricsSnapshot // contrato JSON completo do processo descrito acima
+}
+```
+
+`WORKER_METRICS_INTERVAL_MS` tem default de `10000` ms (faixa permitida `50..3600000`). Uma amostra é tentada após a composição válida do worker, periodicamente e em best-effort no encerramento gracioso. Snapshots idênticos já escritos com sucesso são omitidos. Os contadores são observações cumulativas desde o início daquele processo/contexto; zeram no reinício e **não** representam um censo das linhas atuais do banco. Use `executionId` para distinguir resets e calcule diferenças em vez de somar snapshots cumulativos sucessivos.
+
+O reporter permite no máximo uma escrita pendente e não mantém fila de amostras. Enquanto essa escrita estiver pendente, novas amostras são descartadas antes de consultar o coletor. Exceções e escritas rejeitadas são contidas; uma escrita que nunca conclui suprime novas amostras daquele reporter sem bloquear operações financeiras ou shutdown. Uma amostra posterior bem-sucedida inclui os contadores acumulados do coletor, mas registros intermediários podem ser perdidos. A entrega é best-effort, sem persistência ou agregação entre processos. `GET /metrics` continua expondo **somente o processo HTTP que atende à requisição**.
+
 #### Health Checks e Readiness
 
 - `GET /health/live`: Confirma que o event loop do processo HTTP está responsivo (`200 OK`).
@@ -1035,7 +1079,7 @@ Expõe um snapshot JSON imutável (`scope: "process"`) mantido pelo [`DefaultOpe
 #### Limitações Operacionais Conhecidas
 
 1. **Autenticação Externa Não Implementada (Por Decisão de Escopo):** O `ProviderIdentityGuard` é um ponto de extensão no-op conforme permitido pelo enunciado do desafio; validação externa via OIDC/JWKS deve ser implementada antes de expor endpoints HTTP a redes não confiáveis.
-2. **Métricas Voláteis e Escopadas ao Processo:** `GET /metrics` retorna métricas em memória exclusivas do processo HTTP (`scope: "process"`). Os processos standalone de workers (`consume-wagers.ts`, `publish-outbox.ts`, `resolve-pending-references.ts`) mantêm seus próprios coletores em memória e não exportam para um agregador distribuído externo (como Prometheus/OpenTelemetry) nesta entrega.
+2. **Métricas Voláteis e Escopadas ao Processo:** `GET /metrics` retorna métricas em memória exclusivas do processo HTTP (`scope: "process"`). Os processos standalone de workers (`consume-wagers.ts`, `publish-outbox.ts`, `resolve-pending-references.ts`) exportam seus próprios coletores em memória como NDJSON em stderr; não há agregador externo de séries temporais nem armazenamento persistente de métricas.
 3. **Entrega At-Least-Once na Outbox:** O `OutboxPublisher` garante entrega at-least-once na fila `wagering-events.fifo`. Consumidores downstream devem deduplicar eventos de integração por `eventId`.
 4. **Envelopes Mistos na DLQ:** A fila `wager-transactions-dlq.fifo` pode receber tanto envelopes diagnósticos sanitizados `WagerTransactionDeadLetter` (para erros permanentes de contrato) quanto envelopes originais `WagerTransactionRequested` (via `RedrivePolicy` nativa do SQS após `maxReceiveCount` falhas transitórias/desconhecidas). Operadores devem inspecionar o campo `type` antes de reprocessar itens da DLQ e nunca reenviar um envelope diagnóstico como comando financeiro.
 5. **TypeScript `skipLibCheck`:** Seguindo a recomendação oficial do Bun, `skipLibCheck: true` está habilitado no `tsconfig.json` para evitar conflitos internos de declarações transitivas entre `@types/bun` e `@types/node`, mantendo verificação estrita completa (`strict: true`, `exactOptionalPropertyTypes: true`, `noUncheckedIndexedAccess: true`) em todos os arquivos de código, scripts e testes do projeto.

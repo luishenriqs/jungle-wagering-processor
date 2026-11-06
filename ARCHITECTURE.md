@@ -17,7 +17,7 @@
 - **IMP-04 Delivery Evidence:** [`FINAL-DELIVERY-EVIDENCE.md`](FINAL-DELIVERY-EVIDENCE.md)
 - **Historical Package Evidence:** [`IMP-01-EVIDENCE.md`](IMP-01-EVIDENCE.md), [`IMP-02-EVIDENCE.md`](IMP-02-EVIDENCE.md), [`IMP-03-EVIDENCE.md`](IMP-03-EVIDENCE.md)
 
-**Current Verified Baseline:** All implementation packages (`IMP-01` through `IMP-04`) and post-audit hardening packages (`FIX-D01`, `FIX-D02`, and `AUDIT-D03-FIX-01`) are complete and verified with **1,247 passing tests** (`994` unit tests across `27` files + `253` integration tests across `15` files), **0 failures**, and **8,347 assertions**, plus `bun run typecheck` (`tsc --noEmit`).
+**Current Verified Baseline:** All implementation packages (`IMP-01` through `IMP-04`) and post-audit hardening packages (`FIX-D01`, `FIX-D02`, `AUDIT-D03-FIX-01`, and `AUDIT-D04-FIX-01`) are complete and verified with **1,274 passing tests** (`1,006` unit tests across `28` files + `268` integration tests across `16` files), **0 failures**, and **8,572 assertions**, plus `bun run typecheck` (`tsc --noEmit`). Results were verified in separate unit/integration runs; see [`D04 evidence`](AUDIT-D04-FIX-01-EVIDENCE.md).
 
 ---
 
@@ -364,6 +364,12 @@ Schema management is governed strictly by versioned, transactional, reversible m
 - **Operational Metrics (`MetricsController` & `DefaultOperationalMetricsCollector`):**
   - `DatabaseModule` provides a single `OPERATIONAL_METRICS` collector instance shared across the financial use cases and workers within that DI graph.
   - `GET /metrics` returns a deep-frozen `OperationalMetricsSnapshot` (`scope: "process"`). Counters saturate at `Number.MAX_SAFE_INTEGER`, label sets have fixed cardinality, and `operationalMetricsEmitter` isolates observer exceptions, rejected promises, and reentrancy so observability faults can never alter financial outcomes.
+- **Standalone Worker Export (`WorkerMetricsReporter`, D04):**
+  - Each standalone DI graph injects its existing `OPERATIONAL_METRICS` into one reporter. HTTP composition and `/metrics` remain unchanged. No second collector, network listener, database write or service is added.
+  - NDJSON on `stderr`: `{type: "OperationalMetricsSnapshot", version: 1, component, executionId, pid, timestamp, snapshot}`. A closed projection copies only the complete existing metric catalog with fixed field names and finite non-negative safe integers; arbitrary extra fields, getters and custom `toJSON` values are rejected.
+  - Starts on `onApplicationBootstrap`, after provider/configuration validation. Default interval `WORKER_METRICS_INTERVAL_MS=10000`, range `50..3600000` ms; emits an initial snapshot, skips unchanged successful samples and attempts a final changed sample on `onApplicationShutdown`. Existing signal coordination drains financial work before closing the Nest context.
+  - At most one native writer Promise is observed. No sample queue, repeated snapshot allocation under backpressure, awaited writes or telemetry retries in financial transactions. Throws/rejections are isolated; a permanently pending receipt suppresses subsequent samples. The timer is cancelled on shutdown, which never waits for telemetry.
+  - Counters remain cumulative process/context observations, reset on restart and are not a database census. `executionId` distinguishes executions. Export is best-effort: records may be lost, with no metric persistence or cross-process aggregation. Consumers must not sum successive cumulative snapshots.
 - **Structured Logging (`operational-logging.ts`):**
   - Emits sanitized single-line JSON logs to `stderr` (`stderrOperationalLog`), propagating `x-correlation-id` and redacting sensitive keys and credentials.
 
@@ -439,7 +445,7 @@ Following Section 2 of [`technical-challenge.md`](technical-challenge.md), exter
 - **Evidência de Entrega do IMP-04:** [`FINAL-DELIVERY-EVIDENCE.md`](FINAL-DELIVERY-EVIDENCE.md)
 - **Evidências Históricas por Pacote:** [`IMP-01-EVIDENCE.md`](IMP-01-EVIDENCE.md), [`IMP-02-EVIDENCE.md`](IMP-02-EVIDENCE.md), [`IMP-03-EVIDENCE.md`](IMP-03-EVIDENCE.md)
 
-**Baseline Atual Verificada:** Todos os pacotes de implementação (`IMP-01` a `IMP-04`) e os pacotes de endurecimento pós-auditoria (`FIX-D01`, `FIX-D02` e `AUDIT-D03-FIX-01`) estão concluídos e verificados com **1.247 testes aprovados** (`994` unitários em `27` arquivos + `253` de integração em `15` arquivos), **0 falhas** e **8.347 asserções**, além de `bun run typecheck` (`tsc --noEmit`).
+**Baseline Atual Verificada:** Todos os pacotes de implementação (`IMP-01` a `IMP-04`) e os pacotes de endurecimento pós-auditoria (`FIX-D01`, `FIX-D02`, `AUDIT-D03-FIX-01` e `AUDIT-D04-FIX-01`) estão concluídos e verificados com **1.274 testes aprovados** (`1.006` unitários em `28` arquivos + `268` de integração em `16` arquivos), **0 falhas** e **8.572 asserções**, além de `bun run typecheck` (`tsc --noEmit`). Resultados verificados em execuções separadas das suítes; consulte a [evidência D04](AUDIT-D04-FIX-01-EVIDENCE.md).
 
 ---
 
@@ -786,6 +792,12 @@ O gerenciamento de schema é controlado exclusivamente por migrations versionada
 - **Métricas Operacionais (`MetricsController` e `DefaultOperationalMetricsCollector`):**
   - `DatabaseModule` fornece uma única instância de `OPERATIONAL_METRICS` compartilhada entre os casos de uso financeiros e os workers daquele grafo de injeção de dependências.
   - `GET /metrics` retorna um `OperationalMetricsSnapshot` congelado recursivamente (`scope: "process"`). Contadores saturam em `Number.MAX_SAFE_INTEGER`, labels possuem cardinalidade fixa e `operationalMetricsEmitter` isola exceções, promises rejeitadas e reentrância de observadores para que falhas de observabilidade jamais alterem resultados financeiros.
+- **Exportação dos Workers Standalone (`WorkerMetricsReporter`, D04):**
+  - Cada grafo DI standalone injeta seu `OPERATIONAL_METRICS` existente em um reporter. A composição HTTP e `/metrics` permanecem iguais. Não há segundo coletor, listener de rede, escrita no banco ou serviço adicional.
+  - NDJSON em `stderr`: `{type: "OperationalMetricsSnapshot", version: 1, component, executionId, pid, timestamp, snapshot}`. Uma projeção fechada copia somente o catálogo completo existente, com nomes fixos e inteiros seguros, finitos e não negativos; campos extras, getters e valores com `toJSON` customizado são rejeitados.
+  - Inicia em `onApplicationBootstrap`, após a validação de providers/configuração. Intervalo default `WORKER_METRICS_INTERVAL_MS=10000`, faixa `50..3600000` ms; emite uma amostra inicial, omite amostras idênticas já confirmadas e tenta uma última amostra alterada em `onApplicationShutdown`. A coordenação de sinais existente drena operações financeiras antes de fechar o contexto Nest.
+  - Observa no máximo uma Promise nativa de escrita. Sem fila de amostras, novas alocações de snapshot sob backpressure, espera por escrita ou retries de telemetria em transações financeiras. Exceções/rejeições são isoladas; um receipt permanentemente pendente suprime novas amostras. O timer é cancelado no shutdown, que nunca aguarda a telemetria.
+  - Contadores continuam cumulativos por processo/contexto, zeram no reinício e não são um censo do banco. `executionId` distingue execuções. A exportação é best-effort: registros podem ser perdidos, sem persistência ou agregação entre processos. Consumidores não devem somar snapshots cumulativos sucessivos.
 - **Logs Estruturados (`operational-logging.ts`):**
   - Emite logs JSON sanitizados de linha única em `stderr` (`stderrOperationalLog`), propagando `x-correlation-id` e redigindo chaves sensíveis e credenciais.
 

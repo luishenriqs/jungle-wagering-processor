@@ -9,9 +9,9 @@ export const entrypoints = [
 ] as const;
 export type Entrypoint = typeof entrypoints[number][0];
 export interface EntrypointRecord { component?: string; phase?: string; action?: string; code?: string }
-export function entrypointClient(script: Entrypoint, env: Record<string, string | undefined>) {
+export function entrypointClient(script: Entrypoint, env: Record<string, string | undefined>, preloads: readonly string[] = []) {
   entrypointIsolation(env); // Validate the exact environment passed to the child, before spawn.
-  const child = spawn(process.execPath, ['--preload', './test/support/entrypoint-preload.ts', script],
+  const child = spawn(process.execPath, ['--preload', './test/support/entrypoint-preload.ts', ...preloads.flatMap(path => ['--preload', path]), script],
     { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] });
   const records: EntrypointRecord[] = []; let ended = false; let invalidOutput = false;
   const listeners = new Set<() => void>();
