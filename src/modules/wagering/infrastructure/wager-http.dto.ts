@@ -66,9 +66,7 @@ export function wagerHttpStatus(result: ProcessWagerResult): number {
 }
 
 export function wagerQueryText(value: unknown): string {
-  const result = text(value);
-  if (result !== result.trim()) throw new InvalidDomainInputError('Invalid external identifier');
-  return result;
+  return text(value);
 }
 export function toWagerHttpResponse(transaction: WagerTransaction) {
   return { transactionId: transaction.id, providerId: transaction.providerId, externalTransactionId: transaction.externalTransactionId,

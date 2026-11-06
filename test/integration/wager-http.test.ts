@@ -472,7 +472,8 @@ test('CP03 resolved references and currency-mismatch snapshots use persisted tra
 });
 test('CP03 resource-specific 404 mappings and invalid GETs preserve all five tables and the POST contract', async () => {
   const wallet = await h.wallet(); const before = await queryDatabaseSnapshot();
-  for (const path of [`/wagering/transactions/${crypto.randomUUID()}`, '/providers/no-provider/wagering/transactions/no-transaction']) {
+  for (const path of [`/wagering/transactions/${crypto.randomUUID()}`, '/providers/no-provider/wagering/transactions/no-transaction',
+    '/providers/provider/wagering/transactions/key%20']) {
     const missing = await wagerGet(path);
     expect(missing.response.status).toBe(404); expect(missing.data as unknown).toEqual({ code: 'WAGER_NOT_FOUND', message: 'Wager transaction not found' });
   }
@@ -480,10 +481,89 @@ test('CP03 resource-specific 404 mappings and invalid GETs preserve all five tab
   expect(missingWallet.status).toBe(404); expect(await missingWallet.json()).toEqual({ code: 'WALLET_NOT_FOUND', message: 'Wallet not found' });
   const missingPost = await post(request(wallet, { walletId: crypto.randomUUID() }));
   expect(missingPost.response.status).toBe(404); expect(missingPost.result as unknown).toEqual({ code: 'WALLET_NOT_FOUND', message: 'Wallet not found' });
-  for (const path of ['/wagering/transactions/invalid', '/providers/%20/wagering/transactions/key', '/providers/provider/wagering/transactions/key%20']) {
+  for (const path of ['/wagering/transactions/invalid', '/providers/%20/wagering/transactions/key', '/providers/provider/wagering/transactions/%20']) {
     expect((await wagerGet(path)).response.status).toBe(400);
   }
   expect(await queryDatabaseSnapshot()).toEqual(before);
+});
+test('D03-T01..T10 literal external identifiers with peripheral whitespace are consistent across POST, SQS, GET, replay, and concurrency', async () => {
+  const wallet = await h.wallet('100.00');
+  const pairs = [
+    { providerId: 'prov-t01', externalTransactionId: 'ext-t01', key: 'k-d03-t01' },
+    { providerId: ' prov-t02 ', externalTransactionId: 'ext-t02', key: 'k-d03-t02' },
+    { providerId: 'prov-t03', externalTransactionId: ' ext-t03 ', key: 'k-d03-t03' },
+    { providerId: ' prov-t04 ', externalTransactionId: ' ext-t04 ', key: 'k-d03-t04' },
+  ];
+  for (const p of pairs) {
+    const input = request(wallet, { providerId: p.providerId, externalTransactionId: p.externalTransactionId, idempotencyKey: p.key, money: { amount: '5.00', currency: 'BRL' } });
+    const created = await post(input);
+    expect(created.response.status).toBe(200);
+    expect(created.result.idempotentReplay).toBe(false);
+    const tx = (await h.uow.run(store => store.getWager(created.result.transactionId)))!;
+    const data = await getBoth(tx);
+    expect(data.providerId).toBe(p.providerId);
+    expect(data.externalTransactionId).toBe(p.externalTransactionId);
+    if (p.providerId !== p.providerId.trim() || p.externalTransactionId !== p.externalTransactionId.trim()) {
+      const trimmedPath = `/providers/${encodeURIComponent(p.providerId.trim())}/wagering/transactions/${encodeURIComponent(p.externalTransactionId.trim())}`;
+      expect((await wagerGet(trimmedPath)).response.status).toBe(404);
+    }
+    const replay = await post(input);
+    expect(replay.response.status).toBe(200);
+    expect(replay.result).toEqual({ ...created.result, idempotentReplay: true });
+  }
+  // D03-T06: "ABC", " ABC", "ABC " remain distinct external identities with distinct payload hashes
+  const distinctExt = ['ABC', ' ABC', 'ABC '] as const;
+  const distinctInputs = distinctExt.map((ext, i) => request(wallet, {
+    providerId: 'prov-t06', externalTransactionId: ext, idempotencyKey: `k-d03-t06-${i}`, money: { amount: '2.00', currency: 'BRL' },
+  }));
+  expect(new Set(distinctInputs.map(wagerPayloadHash)).size).toBe(3);
+  const distinctTxIds: string[] = [];
+  for (const input of distinctInputs) {
+    const res = await post(input);
+    expect(res.response.status).toBe(200);
+    expect(res.result.idempotentReplay).toBe(false);
+    distinctTxIds.push(res.result.transactionId);
+  }
+  expect(new Set(distinctTxIds).size).toBe(3);
+  for (let i = 0; i < distinctExt.length; i++) {
+    const ext = distinctExt[i]!;
+    const queried = await wagerGet(`/providers/prov-t06/wagering/transactions/${encodeURIComponent(ext)}`);
+    expect(queried.response.status).toBe(200);
+    expect(queried.data.transactionId).toBe(distinctTxIds[i]!);
+    expect(queried.data.externalTransactionId).toBe(ext);
+  }
+  // D03-T07: Concurrent POSTs on the same peripheral-whitespace identity produce a single financial effect
+  const concInput = request(wallet, {
+    providerId: ' prov-t07 ', externalTransactionId: ' ext-t07 ', idempotencyKey: 'k-d03-t07', money: { amount: '3.00', currency: 'BRL' },
+  });
+  const concResults = await Promise.all(Array.from({ length: 5 }, () => post(concInput)));
+  expect(concResults.every(r => r.response.status === 200)).toBe(true);
+  expect(new Set(concResults.map(r => r.result.transactionId)).size).toBe(1);
+  expect(concResults.filter(r => !r.result.idempotentReplay)).toHaveLength(1);
+  expect(concResults.filter(r => r.result.idempotentReplay)).toHaveLength(4);
+  const concQueried = await wagerGet(`/providers/${encodeURIComponent(' prov-t07 ')}/wagering/transactions/${encodeURIComponent(' ext-t07 ')}`);
+  expect(concQueried.response.status).toBe(200);
+  expect(concQueried.data.transactionId).toBe(concResults[0]!.result.transactionId);
+  // D03-T08: SQS consumer accepts peripheral-whitespace external identity and HTTP GET retrieves it verbatim
+  const sqsInput = request(wallet, {
+    providerId: ' prov-t08 ', externalTransactionId: ' ext-t08 ', idempotencyKey: 'k-d03-t08', money: { amount: '4.00', currency: 'BRL' },
+  });
+  const sqsMsg = await delivery(sqsInput);
+  expect((await sqsMsg.handle()).action).toBe('acked');
+  await assertInbox(sqsMsg.messageId);
+  const sqsQueried = await wagerGet(`/providers/${encodeURIComponent(' prov-t08 ')}/wagering/transactions/${encodeURIComponent(' ext-t08 ')}`);
+  expect(sqsQueried.response.status).toBe(200);
+  expect(sqsQueried.data.providerId).toBe(' prov-t08 ');
+  expect(sqsQueried.data.externalTransactionId).toBe(' ext-t08 ');
+  const sqsHttpReplay = await post(sqsInput);
+  expect(sqsHttpReplay.response.status).toBe(200);
+  expect(sqsHttpReplay.result).toEqual({
+    transactionId: sqsQueried.data.transactionId,
+    status: S.Processed,
+    balance: { amount: '67.00', currency: 'BRL' },
+    idempotentReplay: true,
+  });
+  await balance(wallet.id, '67.00');
 });
 test('CP03 GETs do not wait on a financial row lock and observe only committed state during processing', async () => {
   const wallet = await h.wallet(); const earlier = await h.process.execute(request(wallet));

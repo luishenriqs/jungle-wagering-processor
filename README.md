@@ -55,9 +55,9 @@ In distributed iGaming environments, provider messages arrive under **at-least-o
 
 #### Current Validation Status & Documentation Map
 
-All implementation packages (`IMP-01` through `IMP-04`) and post-audit hardening packages (`FIX-D01` and `FIX-D02`) are complete and verified:
+All implementation packages (`IMP-01` through `IMP-04`) and post-audit hardening packages (`FIX-D01`, `FIX-D02`, and `AUDIT-D03-FIX-01`) are complete and verified:
 
-- **Consolidated Test Suite:** **1,243 passing tests** (`991` unit tests across `27` files + `252` integration tests across `15` files), **0 failures**, and **8,253 assertions**, plus `bun run typecheck` (`tsc --noEmit`).
+- **Consolidated Test Suite:** **1,247 passing tests** (`994` unit tests across `27` files + `253` integration tests across `15` files), **0 failures**, and **8,347 assertions**, plus `bun run typecheck` (`tsc --noEmit`).
 - **Architecture & Design Decisions:** [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - **Consolidated Delivery Evidence (`FIX-D01` + `FIX-D02`):** [`FIX-D01-D02-FINAL-EVIDENCE.md`](FIX-D01-D02-FINAL-EVIDENCE.md)
 - **PostgreSQL Monetary Finiteness Evidence (`FIX-D01`):** [`FIX-D01-EVIDENCE.md`](FIX-D01-EVIDENCE.md)
@@ -396,6 +396,7 @@ Retrieve a persisted wager transaction by internal `transactionId` (UUID) or by 
 }
 ```
 
+- **External Identifier Preservation (`ARC2-02` & `AUDIT-D03-FIX-01`):** `:providerId` and `:externalTransactionId` are validated as required non-empty `TEXT` strings (`value.trim().length > 0`) and preserve their exact literal spelling (including URL-encoded peripheral whitespace when present, superseding the restrictive `IMP-04/CP-03` peripheral-whitespace path filter), matching `POST /wagering/transactions` and SQS consumption.
 - **Errors:** `400 Bad Request` (`INVALID_INPUT`), `404 Not Found` (`WAGER_NOT_FOUND`), `503 Service Unavailable`.
 
 #### 5.7 `GET /health/live`, `GET /health/ready`, and `GET /metrics`
@@ -425,13 +426,13 @@ All non-2xx errors thrown through [`HttpExceptionFilter`](src/shared/infrastruct
 # Static type checking (TypeScript 5.9.3 strict mode)
 bun run typecheck
 
-# Unit tests only (991 tests across 27 files; no Docker containers required)
+# Unit tests only (994 tests across 27 files; no Docker containers required)
 bun run test:unit
 
-# Integration tests only (252 tests across 15 files; requires postgres-test on 5434 and LocalStack on 4566)
+# Integration tests only (253 tests across 15 files; requires postgres-test on 5434 and LocalStack on 4566)
 bun run test:integration
 
-# Full test suite (1,243 tests across 42 files; 8,253 assertions)
+# Full test suite (1,247 tests across 42 files; 8,347 assertions)
 bun test
 
 # Check working tree for whitespace or conflict markers
@@ -440,7 +441,7 @@ git diff --check
 
 #### Test Categories and Coverage
 
-1. **Unit Tests (`test/unit/*.test.ts` — 991 tests, 27 files):**
+1. **Unit Tests (`test/unit/*.test.ts` — 994 tests, 27 files):**
    - `Money` precision, scale validation, currency mismatch rejection, and `NUMERIC(18,2)` overflow bounds.
    - `Wallet` opening, debit/credit transitions, version increments, and `WalletLedgerEntry` balance arithmetic.
    - `WagerTransaction` state machine transitions, `evaluateWager` business rules for `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK`, chained reversals, and canonical payload hashing.
@@ -573,9 +574,9 @@ Em ambientes distribuídos de iGaming, mensagens de provedores são entregues so
 
 #### Estado Atual da Validação e Mapa Documental
 
-Todos os pacotes de implementação (`IMP-01` a `IMP-04`) e as correções pós-auditoria (`FIX-D01` e `FIX-D02`) estão concluídos e verificados:
+Todos os pacotes de implementação (`IMP-01` a `IMP-04`) e as correções pós-auditoria (`FIX-D01`, `FIX-D02` e `AUDIT-D03-FIX-01`) estão concluídos e verificados:
 
-- **Suíte Consolidada de Testes:** **1.243 testes aprovados** (`991` unitários em `27` arquivos + `252` de integração em `15` arquivos), **0 falhas** e **8.253 asserções**, além de `bun run typecheck` (`tsc --noEmit`).
+- **Suíte Consolidada de Testes:** **1.247 testes aprovados** (`994` unitários em `27` arquivos + `253` de integração em `15` arquivos), **0 falhas** e **8.347 asserções**, além de `bun run typecheck` (`tsc --noEmit`).
 - **Arquitetura e Decisões Técnicas:** [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - **Evidência Consolidada da Entrega (`FIX-D01` + `FIX-D02`):** [`FIX-D01-D02-FINAL-EVIDENCE.md`](FIX-D01-D02-FINAL-EVIDENCE.md)
 - **Evidência de Finitude Monetária no PostgreSQL (`FIX-D01`):** [`FIX-D01-EVIDENCE.md`](FIX-D01-EVIDENCE.md)
@@ -914,6 +915,7 @@ Consultam uma transação persistida pelo `transactionId` interno (UUID) ou por 
 }
 ```
 
+- **Preservação Literal de Identificadores Externos (`ARC2-02` e `AUDIT-D03-FIX-01`):** `:providerId` e `:externalTransactionId` são validados como strings `TEXT` obrigatórias não vazias (`value.trim().length > 0`) e preservam sua grafia literal exata (incluindo eventuais espaços periféricos URL-encoded, superando o filtro restritivo de `IMP-04/CP-03`), de forma consistente com `POST /wagering/transactions` e o consumo SQS.
 - **Erros:** `400 Bad Request` (`INVALID_INPUT`), `404 Not Found` (`WAGER_NOT_FOUND`), `503 Service Unavailable`.
 
 #### 5.7 `GET /health/live`, `GET /health/ready` e `GET /metrics`
@@ -943,13 +945,13 @@ Todos os erros não-2xx tratados pelo [`HttpExceptionFilter`](src/shared/infrast
 # Verificação estática de tipos (TypeScript 5.9.3 modo estrito)
 bun run typecheck
 
-# Apenas testes unitários (991 testes em 27 arquivos; não requer containers Docker)
+# Apenas testes unitários (994 testes em 27 arquivos; não requer containers Docker)
 bun run test:unit
 
-# Apenas testes de integração (252 testes em 15 arquivos; requer postgres-test na 5434 e LocalStack na 4566)
+# Apenas testes de integração (253 testes em 15 arquivos; requer postgres-test na 5434 e LocalStack na 4566)
 bun run test:integration
 
-# Suíte completa (1.243 testes em 42 arquivos; 8.253 asserções)
+# Suíte completa (1.247 testes em 42 arquivos; 8.347 asserções)
 bun test
 
 # Verificação de formatação do diff e marcadores de conflito
@@ -958,7 +960,7 @@ git diff --check
 
 #### Categorias de Testes e Cobertura
 
-1. **Testes Unitários (`test/unit/*.test.ts` — 991 testes, 27 arquivos):**
+1. **Testes Unitários (`test/unit/*.test.ts` — 994 testes, 27 arquivos):**
    - Precisão de `Money`, validação de escala, rejeição de moedas divergentes e limites de overflow `NUMERIC(18,2)`.
    - Abertura de `Wallet`, transições de débito/crédito, incremento de versão e aritmética de `WalletLedgerEntry`.
    - Máquina de estados de `WagerTransaction`, regras de negócio `evaluateWager` para `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK`, reversões encadeadas e hash canônico de payload.

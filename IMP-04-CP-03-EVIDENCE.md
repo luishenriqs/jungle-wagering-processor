@@ -66,6 +66,8 @@ Retorna 200 para qualquer transação existente, incluindo PENDING, PENDING_REFE
 
 Valida providerId/externalTransactionId como texto não vazio e sem espaços periféricos antes do caso de uso. Utiliza a consulta existente pelo par exato, preservando identificadores externos TEXT. A mesma transação consultada pelos dois GETs produz JSON idêntico.
 
+> **Nota de Decisão Superveniente (`AUDIT-D03-FIX-01` — 06/11/2026):** Por decisão executiva de Luís Henrique Pereira após a auditoria `AUDIT-D03-01`, prevalece a regra arquitetural `ARC2-02` (*"Preserva-se a grafia do identificador externo"*), superando a restrição de espaços periféricos introduzida neste checkpoint para [`wagerQueryText`](src/modules/wagering/infrastructure/wager-http.dto.ts). `providerId` e `externalTransactionId` continuam exigindo texto obrigatório não vazio (`value.trim().length > 0`), mas preservam espaços periféricos como parte literal da identidade externa de forma consistente entre `POST /wagering/transactions`, SQS `wager-transactions.fifo`, `GetWagerTransactionUseCase` e `GET /providers/:providerId/wagering/transactions/:externalTransactionId`. Os registros históricos abaixo permanecem inalterados como evidência da execução original do `IMP-04/CP-03`.
+
 A consulta por provider mantém filtro lógico de dados, não autenticação real. SYSTEM/OPENING podem ser consultados; a proibição da submissão externa não foi aplicada às leituras.
 
 ### Projeção pública e erros de Wager

@@ -164,8 +164,13 @@ import { toWagerHttpResponse, wagerQueryText } from '../../src/modules/wagering/
 import { WagerTransaction } from '../../src/modules/wagering/domain/wager-transaction';
 import { Money } from '../../src/shared/domain/money';
 
-for (const value of [undefined, null, 1, [], {}, '', ' ', ' provider', 'provider ', '\tprovider', 'provider\n']) {
+for (const value of [undefined, null, 1, [], {}, '', ' ', '   ', '\t\n']) {
   test(`CP03 external query identifier rejects ${JSON.stringify(value)}`, () => expect(() => wagerQueryText(value)).toThrow());
+}
+for (const value of [' provider', 'provider ', ' provider ', '\tprovider', 'provider\n']) {
+  test(`D03 external query identifier preserves peripheral whitespace in ${JSON.stringify(value)}`, () => {
+    expect(wagerQueryText(value)).toBe(value);
+  });
 }
 test('CP03 query projection includes exact public fields and nulls, including PENDING and OPENING', () => {
   expect(wagerQueryText('SYSTEM')).toBe('SYSTEM'); expect(wagerQueryText('external:test-01')).toBe('external:test-01');
@@ -190,15 +195,17 @@ test('CP03 invalid query path identifiers are 400 before UoW; unexpected query e
   try {
     await app.listen(0, '127.0.0.1'); const url = await app.getUrl();
     for (const path of ['/wagering/transactions/invalid', '/wagering/transactions/%20', '/providers/%20/wagering/transactions/key',
-      '/providers/%20provider/wagering/transactions/key', '/providers/provider%20/wagering/transactions/key',
-      '/providers/provider/wagering/transactions/%20', '/providers/provider/wagering/transactions/%20key', '/providers/provider/wagering/transactions/key%20']) {
+      '/providers/provider/wagering/transactions/%20']) {
       expect((await fetch(`${url}${path}`)).status).toBe(400);
     }
     expect(calls).toBe(0);
-    for (const path of [`/wagering/transactions/${valid.walletId}`, '/providers/provider-test/wagering/transactions/external-test']) {
+    for (const path of [`/wagering/transactions/${valid.walletId}`, '/providers/provider-test/wagering/transactions/external-test',
+      '/providers/%20provider/wagering/transactions/key', '/providers/provider%20/wagering/transactions/key',
+      '/providers/provider/wagering/transactions/%20key', '/providers/provider/wagering/transactions/key%20']) {
       const response = await fetch(`${url}${path}`);
       expect(response.status).toBe(500); expect(await response.json()).toEqual({ code: 'INTERNAL_SERVER_ERROR', message: 'Internal server error' });
       expect(response.headers.get('x-correlation-id')).toMatch(/^[a-f0-9-]{36}$/);
     }
+    expect(calls).toBe(6);
   } finally { await app.close(); }
 });
