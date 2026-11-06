@@ -8,15 +8,18 @@ import { pendingReferencePolicy, type PendingReferencePolicy } from './applicati
 import { PendingReferenceWorker } from './application/pending-reference-worker';
 import { PendingReferenceLifecycle } from './infrastructure/pending-reference-lifecycle';
 import { stderrOperationalLog } from '../../shared/infrastructure/structured-logger';
+import { OPERATIONAL_METRICS, type OperationalMetricsCollector } from '../../shared/application/operational-metrics';
+
+interface StandaloneMetricsOptions { readonly metrics?: OperationalMetricsCollector | undefined }
 
 @Module({})
 export class WageringModule {
   static forHttp(database: DynamicModule): DynamicModule {
     return { module: WageringModule, imports: [database], controllers: [WageringController], providers: [ProviderIdentityGuard] };
   }
-  static forPendingReferences(): DynamicModule {
+  static forPendingReferences(options: StandaloneMetricsOptions = {}): DynamicModule {
     const POLICY = Symbol('PENDING_REFERENCE_POLICY'); const LOOP = Symbol('PENDING_REFERENCE_LOOP');
-    return { module: WageringModule, imports: [DatabaseModule.forRoot()], providers: [
+    return { module: WageringModule, imports: [DatabaseModule.forRoot({ metrics: options.metrics })], providers: [
       { provide: CLOCK, useFactory: () => new SystemClock() },
       { provide: POLICY, useFactory: () => pendingReferencePolicy() },
       { provide: LOOP, useFactory: () => {
@@ -27,9 +30,9 @@ export class WageringModule {
         };
         return { pollMs: integer('PENDING_REF_POLL_INTERVAL_MS', 250, 60000), batchSize: integer('PENDING_REF_BATCH_SIZE', 100, 1000) };
       } },
-      { provide: PendingReferenceWorker, inject: [FINANCIAL_UNIT_OF_WORK, CLOCK, POLICY],
-        useFactory: (uow: FinancialUnitOfWork, clock: ClockPort, policy: PendingReferencePolicy) =>
-          new PendingReferenceWorker(uow, clock, policy, { operationalLog: stderrOperationalLog }) },
+      { provide: PendingReferenceWorker, inject: [FINANCIAL_UNIT_OF_WORK, CLOCK, POLICY, OPERATIONAL_METRICS],
+        useFactory: (uow: FinancialUnitOfWork, clock: ClockPort, policy: PendingReferencePolicy, metrics: OperationalMetricsCollector) =>
+          new PendingReferenceWorker(uow, clock, policy, { operationalLog: stderrOperationalLog, operationalMetrics: metrics }) },
       { provide: PendingReferenceLifecycle, inject: [PendingReferenceWorker, LOOP],
         useFactory: (worker: PendingReferenceWorker, loop: { pollMs: number; batchSize: number }) => new PendingReferenceLifecycle(worker, loop.pollMs, loop.batchSize) },
     ], exports: [PendingReferenceWorker] };

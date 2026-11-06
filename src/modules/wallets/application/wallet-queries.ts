@@ -4,6 +4,7 @@ import { internalId } from '../../../shared/application/identifiers';
 import { CurrencyMismatchError, InvalidDomainInputError, InvalidMoneyError, MoneyOverflowError } from '../../../shared/domain/domain-errors';
 import { Money } from '../../../shared/domain/money';
 import { isolatedObserver, operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
+import { operationalMetricsEmitter, type OperationalMetricsOptions } from '../../../shared/application/operational-metrics';
 
 export class GetWalletUseCase {
   constructor(private readonly uow: FinancialUnitOfWork) {}
@@ -49,11 +50,13 @@ export class ReconcileWalletUseCase {
   #divergenceObservations = 0n;
   private readonly observe;
   private readonly legacyLog;
+  private readonly emitMetric;
   constructor(private readonly uow: FinancialUnitOfWork, private readonly telemetry: {
     log?: (event: { event: 'WalletReconciliationMismatch'; walletId: string; correlationId?: string }) => void;
     metric?: (total: bigint) => void;
-  } & OperationalLoggingOptions = {}) {
+  } & OperationalLoggingOptions & OperationalMetricsOptions = {}) {
     this.observe = operationalEmitter(telemetry.operationalLog); this.legacyLog = isolatedObserver(telemetry.log);
+    this.emitMetric = operationalMetricsEmitter(telemetry.operationalMetrics);
   }
   /** Monotonic total available to a future metrics collector without wallet labels. */
   get divergenceObservations(): bigint { return this.#divergenceObservations; }
@@ -94,6 +97,7 @@ export class ReconcileWalletUseCase {
           walletId: result.walletId, correlationId: context?.correlationId });
         else console.warn(JSON.stringify(event));
       } catch { /* Logging failure cannot invalidate financial reads. */ }
+      this.emitMetric({ type: 'reconciliation-divergence' });
     }
     return result;
   }

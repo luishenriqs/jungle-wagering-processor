@@ -8,12 +8,15 @@ import { createWalletOpening } from '../../wagering/domain/wallet-opening';
 import { wagerPayloadHash } from '../../wagering/application/wager-payload';
 import { WagerTransactionKind } from '../../wagering/domain/wager-transaction';
 import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
+import { operationalMetricsEmitter, type OperationalMetricsOptions } from '../../../shared/application/operational-metrics';
 
 export class CreateWalletUseCase {
   private readonly runtime;
   private readonly observe;
-  constructor(private readonly uow: FinancialUnitOfWork, options: ExecutionOptions & OperationalLoggingOptions = {}) {
+  private readonly emitMetric;
+  constructor(private readonly uow: FinancialUnitOfWork, options: ExecutionOptions & OperationalLoggingOptions & OperationalMetricsOptions = {}) {
     this.runtime = execution(options); this.observe = operationalEmitter(options.operationalLog);
+    this.emitMetric = operationalMetricsEmitter(options.operationalMetrics);
   }
   async execute(input: { playerId: string; initialBalance: MoneyProps; correlationId: string }) {
     requireText(input.playerId, 'playerId');
@@ -43,9 +46,16 @@ export class CreateWalletUseCase {
         return wallet;
       } catch (error) {
         const sql = sqlError(error);
-        if (sql.code === '23505' && sql.constraint === 'uq_wallet_player_currency') throw new ConflictError('Wallet already exists for player and currency', { cause: error });
+        if (sql.code === '23505' && sql.constraint === 'uq_wallet_player_currency') {
+          this.emitMetric({ type: 'concurrency-conflict', code: '23505' });
+          throw new ConflictError('Wallet already exists for player and currency', { cause: error });
+        }
         if (!isTransient(error)) throw error;
+        if (sql.code === '40P01' || sql.code === '40001' || sql.code === '55P03' || sql.code === '57014') {
+          this.emitMetric({ type: 'concurrency-conflict', code: sql.code });
+        }
         if (attempt + 1 >= this.runtime.maxAttempts) throw exhausted(error);
+        this.emitMetric({ type: 'retry-scheduled', target: 'walletUow' });
         await retryDelay(attempt);
       }
     }

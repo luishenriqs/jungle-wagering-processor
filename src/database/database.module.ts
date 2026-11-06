@@ -12,24 +12,35 @@ import { GetWalletUseCase, ListWalletLedgerUseCase, ReconcileWalletUseCase } fro
 import { ProcessWagerTransactionUseCase } from '../modules/wagering/application/process-wager-transaction.use-case';
 import { GetWagerTransactionUseCase } from '../modules/wagering/application/get-wager-transaction.use-case';
 import { stderrOperationalLog } from '../shared/infrastructure/structured-logger';
+import { DefaultOperationalMetricsCollector, OPERATIONAL_METRICS, type OperationalMetricsCollector } from '../shared/application/operational-metrics';
+
+interface DatabaseMetricsOptions { readonly metrics?: OperationalMetricsCollector | undefined }
+
+function metricsProvider(metrics?: OperationalMetricsCollector) {
+  return { provide: OPERATIONAL_METRICS, useFactory: (): OperationalMetricsCollector => metrics ?? new DefaultOperationalMetricsCollector() };
+}
 
 const cases = [CreateWalletUseCase, GetWalletUseCase, ListWalletLedgerUseCase, ReconcileWalletUseCase, ProcessWagerTransactionUseCase, GetWagerTransactionUseCase];
 function caseProviders() {
-  return cases.map(useCase => ({ provide: useCase, inject: [FINANCIAL_UNIT_OF_WORK], useFactory: (work: FinancialUnitOfWork) => {
-    const options = { operationalLog: stderrOperationalLog };
+  return cases.map(useCase => ({ provide: useCase,
+    inject: useCase === CreateWalletUseCase || useCase === ProcessWagerTransactionUseCase || useCase === ReconcileWalletUseCase
+      ? [FINANCIAL_UNIT_OF_WORK, OPERATIONAL_METRICS] : [FINANCIAL_UNIT_OF_WORK],
+    useFactory: (work: FinancialUnitOfWork, metrics?: OperationalMetricsCollector) => {
+    const options = { operationalLog: stderrOperationalLog, operationalMetrics: metrics };
     if (useCase === CreateWalletUseCase) return new CreateWalletUseCase(work, options);
     if (useCase === ProcessWagerTransactionUseCase) return new ProcessWagerTransactionUseCase(work, options);
-    if (useCase === ReconcileWalletUseCase) return new ReconcileWalletUseCase(work);
+    if (useCase === ReconcileWalletUseCase) return new ReconcileWalletUseCase(work, { operationalMetrics: metrics });
     return new useCase(work);
   } }));
 }
 @Module({})
 export class DatabaseModule {
   /** HTTP owns exactly one ORM; an injected UoW retains ownership with its caller. */
-  static forHttp(uow?: FinancialUnitOfWork): DynamicModule {
+  static forHttp(uow?: FinancialUnitOfWork, options: DatabaseMetricsOptions = {}): DynamicModule {
     const resource = Symbol('HTTP_DATABASE_RESOURCE');
     return { module: DatabaseModule,
       providers: [
+        metricsProvider(options.metrics),
         ...(uow ? [] : [
           { provide: resource, useFactory: async () => {
             const url = process.env['DATABASE_URL'];
@@ -51,13 +62,14 @@ export class DatabaseModule {
           },
         },
         ...caseProviders(),
-      ], exports: [FINANCIAL_UNIT_OF_WORK, ...cases, POSTGRES_HEALTH_PROBE] };
+      ], exports: [FINANCIAL_UNIT_OF_WORK, ...cases, POSTGRES_HEALTH_PROBE, OPERATIONAL_METRICS] };
   }
-  static forRoot(): DynamicModule {
+  static forRoot(options: DatabaseMetricsOptions = {}): DynamicModule {
     return { module: DatabaseModule, imports: [MikroOrmModule.forRoot({ ...databaseConfig(), registerRequestContext: false })],
       providers: [
+        metricsProvider(options.metrics),
         { provide: FINANCIAL_UNIT_OF_WORK, inject: [CoreORM], useFactory: (orm: MikroORM) => new PostgresUnitOfWork(orm) },
         ...caseProviders(),
-      ], exports: [FINANCIAL_UNIT_OF_WORK, ...cases] };
+      ], exports: [FINANCIAL_UNIT_OF_WORK, ...cases, OPERATIONAL_METRICS] };
   }
 }

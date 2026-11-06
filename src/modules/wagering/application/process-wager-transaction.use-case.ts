@@ -18,8 +18,9 @@ import { WagerTransactionPendingReference } from '../domain/events/wager-transac
 import { FailureCode } from '../domain/failure-code';
 import { wagerPayloadHash, type WagerPayload } from './wager-payload';
 import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
+import { operationalMetricsEmitter, type OperationalMetricsOptions } from '../../../shared/application/operational-metrics';
 
-export interface ProcessWagerOptions extends ExecutionOptions, OperationalLoggingOptions { readonly pendingReferencePolicy?: PendingReferencePolicy }
+export interface ProcessWagerOptions extends ExecutionOptions, OperationalLoggingOptions, OperationalMetricsOptions { readonly pendingReferencePolicy?: PendingReferencePolicy }
 export interface ProcessWagerInput extends WagerPayload {
   readonly idempotencyKey: string;
   readonly correlationId: string;
@@ -33,17 +34,31 @@ export interface ProcessWagerResult {
   readonly failureCode?: FailureCode;
   readonly idempotentReplay: boolean;
 }
+function nowMs(): number {
+  try { return performance.now(); } catch { return Number.NaN; }
+}
+
+function processingDuration(startedAt: number): number | undefined {
+  const elapsedMs = nowMs() - startedAt;
+  if (!Number.isFinite(startedAt) || startedAt < 0 || !Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs > Number.MAX_SAFE_INTEGER) return undefined;
+  const durationMs = Math.trunc(elapsedMs);
+  return Number.isSafeInteger(durationMs) ? durationMs : undefined;
+}
+
 const BUSINESS_UNIQUES = new Set(['uq_wager_idempotency', 'uq_wager_provider_external']);
 export class ProcessWagerTransactionUseCase {
   private readonly runtime;
   private readonly referencePolicy: PendingReferencePolicy;
   private readonly observe;
+  private readonly emitMetric;
   constructor(private readonly uow: FinancialUnitOfWork, options: ProcessWagerOptions = {}) {
     this.runtime = execution(options);
     this.observe = operationalEmitter(options.operationalLog);
+    this.emitMetric = operationalMetricsEmitter(options.operationalMetrics);
     this.referencePolicy = validatePendingReferencePolicy(options.pendingReferencePolicy ?? pendingReferencePolicy());
   }
   async execute(input: ProcessWagerInput): Promise<ProcessWagerResult> {
+    const startedAt = nowMs();
     const normalized = { ...input, walletId: internalId(input.walletId), money: Money.from(input.money).toJSON() };
     requireText(input.correlationId, 'correlationId');
     const payloadHash = wagerPayloadHash(normalized);
@@ -114,27 +129,43 @@ export class ProcessWagerTransactionUseCase {
             await this.runtime.checkpoint('beforeCommit');
             return this.result(tx, false);
           });
+          const durationMs = processingDuration(startedAt);
           this.observe({ component: 'wagering', event: result.idempotentReplay ? 'wager_replayed'
             : result.status === 'PROCESSED' ? 'wager_processed' : result.status === 'REJECTED' ? 'wager_rejected' : 'wager_pending_reference',
             transactionId: result.transactionId, walletId: normalized.walletId, providerId: input.providerId,
             correlationId: input.correlationId, status: result.status, code: result.failureCode, idempotentReplay: result.idempotentReplay });
+          if (result.idempotentReplay) this.emitMetric({ type: 'duplicate', kind: 'replay' });
+          else if (result.status === 'PROCESSED' || result.status === 'REJECTED' || result.status === 'PENDING_REFERENCE' || result.status === 'FAILED') {
+            this.emitMetric({ type: 'wager-status', status: result.status });
+          }
+          if (durationMs !== undefined) this.emitMetric({ type: 'processing-duration', durationMs });
           return result;
         } catch (error) {
           const sql = sqlError(error);
           const businessCollision = sql.code === '23505' && BUSINESS_UNIQUES.has(sql.constraint ?? '');
           if (businessCollision) {
+            this.emitMetric({ type: 'concurrency-conflict', code: '23505' });
             // The aborted context is gone. Re-read the winner without locking its wallet.
             await this.uow.run(async store => {
               this.matchWinner(await store.findIdentity(identity.idempotencyKey, identity.providerId, identity.externalTransactionId), identity);
             });
           } else if (!isTransient(error)) throw error;
+          else if (sql.code === '40P01' || sql.code === '40001' || sql.code === '55P03' || sql.code === '57014') {
+            this.emitMetric({ type: 'concurrency-conflict', code: sql.code });
+          }
           if (attempt + 1 >= this.runtime.maxAttempts) throw exhausted(error);
+          this.emitMetric({ type: 'retry-scheduled', target: 'wagerUow' });
           await retryDelay(attempt); // No locks or transaction held while waiting.
         }
       }
     } catch (error) {
-      if (error instanceof IdempotencyConflictError) this.observe({ component: 'wagering', event: 'idempotency_conflict',
-        code: 'IDEMPOTENCY_CONFLICT', walletId: normalized.walletId, providerId: input.providerId, correlationId: input.correlationId });
+      if (error instanceof IdempotencyConflictError) {
+        const durationMs = processingDuration(startedAt);
+        this.observe({ component: 'wagering', event: 'idempotency_conflict',
+          code: 'IDEMPOTENCY_CONFLICT', walletId: normalized.walletId, providerId: input.providerId, correlationId: input.correlationId });
+        this.emitMetric({ type: 'duplicate', kind: 'conflict' });
+        if (durationMs !== undefined) this.emitMetric({ type: 'processing-duration', durationMs });
+      }
       throw error;
     }
   }

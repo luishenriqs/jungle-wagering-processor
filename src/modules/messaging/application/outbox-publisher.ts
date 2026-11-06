@@ -6,12 +6,13 @@ import { dateCopy, requireText } from '../../../shared/domain/validation';
 import type { OutboxMessage } from '../domain/outbox-message';
 import type { WorkerConfig } from './worker-config';
 import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
+import { operationalMetricsEmitter, type OperationalMetricsOptions } from '../../../shared/application/operational-metrics';
 
 export interface OutboxTransport { publish(message: OutboxMessage, signal: AbortSignal): Promise<void> }
 export interface PublisherDiagnostic {
   readonly component: 'outbox-publisher'; readonly action: string; readonly code: string; readonly eventId?: string;
 }
-export interface PublisherOptions extends OperationalLoggingOptions {
+export interface PublisherOptions extends OperationalLoggingOptions, OperationalMetricsOptions {
   readonly workerId: string;
   readonly newToken?: () => string;
   readonly diagnose?: (event: PublisherDiagnostic) => void;
@@ -19,12 +20,23 @@ export interface PublisherOptions extends OperationalLoggingOptions {
 export type PublishOutcome = { readonly action: 'idle' }
   | { readonly action: 'published' | 'retry-scheduled' | 'lease-lost' | 'confirmation-pending' | 'retry-pending'; readonly eventId: string };
 
+function outboxLagMs(message: OutboxMessage, observedAt?: Date): number | undefined {
+  try {
+    if (!observedAt) return undefined;
+    const occurredMs = message.occurredAt.getTime(); const observedMs = observedAt.getTime();
+    if (!Number.isSafeInteger(occurredMs) || !Number.isSafeInteger(observedMs)) return undefined;
+    const elapsedMs = observedMs - occurredMs;
+    return Number.isSafeInteger(elapsedMs) ? Math.max(0, elapsedMs) : undefined;
+  } catch { return undefined; }
+}
+
 export class OutboxPublisher {
   private readonly config: WorkerConfig;
   private readonly workerId: string;
   private readonly newToken: () => string;
   private readonly diagnose: (event: PublisherDiagnostic) => void;
   private readonly observe;
+  private readonly emitMetric;
   constructor(private readonly uow: FinancialUnitOfWork, private readonly transport: OutboxTransport,
     private readonly clock: ClockPort, config: WorkerConfig, options: PublisherOptions) {
     requireText(options.workerId, 'workerId');
@@ -36,6 +48,7 @@ export class OutboxPublisher {
     this.newToken = options.newToken ?? randomUUID;
     this.diagnose = options.diagnose ?? (event => console.log(JSON.stringify(event)));
     this.observe = operationalEmitter(options.operationalLog);
+    this.emitMetric = operationalMetricsEmitter(options.operationalMetrics);
   }
   async publishNext(): Promise<PublishOutcome> {
     const now = dateCopy(this.clock.now());
@@ -64,6 +77,7 @@ export class OutboxPublisher {
         const updated = await this.uow.run(store => store.failOutbox(claim.message, claim.workerId, claim.leaseToken, at, code));
         this.log(updated ? 'retry-scheduled' : 'lease-lost', code, eventId);
         this.observe({ component: 'outbox-publisher', event: updated ? 'outbox_retry_scheduled' : 'outbox_lease_lost', code, ...context });
+        if (updated) this.emitMetric({ type: 'retry-scheduled', target: 'outboxPublisher' });
         return { action: updated ? 'retry-scheduled' : 'lease-lost', eventId };
       } catch {
         // DB recovery and lease expiration will make the event claimable again. Never discard it.
@@ -72,10 +86,18 @@ export class OutboxPublisher {
     }
     // Deliberately separate from send catch: uncertain SQL confirmation must not be treated as a failed SQS send.
     try {
-      const completed = await this.uow.run(store => store.completeOutbox(eventId, claim.workerId, claim.leaseToken, dateCopy(this.clock.now())));
+      let observedAt: Date | undefined;
+      const completed = await this.uow.run(store => {
+        const confirmedAt = dateCopy(this.clock.now()); observedAt = confirmedAt;
+        return store.completeOutbox(eventId, claim.workerId, claim.leaseToken, confirmedAt);
+      });
       this.log(completed ? 'published' : 'lease-lost', completed ? 'PUBLISHED' : 'FENCED', eventId);
       this.observe({ component: 'outbox-publisher', event: completed ? 'outbox_confirmed' : 'outbox_lease_lost',
         ...(completed ? {} : { code: 'FENCED' }), ...context });
+      if (completed) {
+        const lagMs = outboxLagMs(claim.message, observedAt);
+        if (lagMs !== undefined) this.emitMetric({ type: 'outbox-publication-confirmed', lagMs });
+      }
       return { action: completed ? 'published' : 'lease-lost', eventId };
     } catch {
       this.log('confirmation-pending', 'CONFIRMATION_PERSIST_FAILED', eventId);

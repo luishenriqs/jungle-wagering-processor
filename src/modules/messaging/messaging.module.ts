@@ -15,13 +15,16 @@ import { AwsSqsConsumerTransport } from './infrastructure/aws-sqs-consumer-trans
 import { ConsumerLifecycle } from './infrastructure/consumer-lifecycle';
 import type { SQSClient } from '@aws-sdk/client-sqs';
 import { stderrOperationalLog } from '../../shared/infrastructure/structured-logger';
+import { OPERATIONAL_METRICS, type OperationalMetricsCollector } from '../../shared/application/operational-metrics';
+
+interface StandaloneMetricsOptions { readonly metrics?: OperationalMetricsCollector | undefined }
 
 const SQS_CLIENT = Symbol('SQS_CLIENT'); const CONFIG = Symbol('SQS_CONSUMER_CONFIG');
 @Module({})
 export class MessagingModule {
   /** Explicit standalone consumer composition; importing the base module starts no workers. */
-  static forConsumer(): DynamicModule {
-    return { module: MessagingModule, imports: [DatabaseModule.forRoot()], providers: [
+  static forConsumer(options: StandaloneMetricsOptions = {}): DynamicModule {
+    return { module: MessagingModule, imports: [DatabaseModule.forRoot({ metrics: options.metrics })], providers: [
       { provide: CLOCK, useFactory: () => new SystemClock() },
       { provide: CONFIG, useFactory: () => consumerConfig() },
       { provide: SQS_CLIENT, useFactory: () => localSqsClient() },
@@ -30,17 +33,17 @@ export class MessagingModule {
           try { return await AwsSqsConsumerTransport.connect(client, config, process.env['SQS_INPUT_QUEUE_NAME'], process.env['SQS_DLQ_QUEUE_NAME']); }
           catch (error) { client.destroy(); throw error; }
         } },
-      { provide: SqsWagerConsumer, inject: [ProcessWagerTransactionUseCase, AwsSqsConsumerTransport, CLOCK, CONFIG],
-        useFactory: (processor: ProcessWagerTransactionUseCase, transport: AwsSqsConsumerTransport, clock: ClockPort, config: ConsumerConfig) =>
-          new SqsWagerConsumer(processor, transport, clock, config, undefined, { operationalLog: stderrOperationalLog }) },
+      { provide: SqsWagerConsumer, inject: [ProcessWagerTransactionUseCase, AwsSqsConsumerTransport, CLOCK, CONFIG, OPERATIONAL_METRICS],
+        useFactory: (processor: ProcessWagerTransactionUseCase, transport: AwsSqsConsumerTransport, clock: ClockPort, config: ConsumerConfig, metrics: OperationalMetricsCollector) =>
+          new SqsWagerConsumer(processor, transport, clock, config, undefined, { operationalLog: stderrOperationalLog, operationalMetrics: metrics }) },
       { provide: ConsumerLifecycle, inject: [SqsWagerConsumer, SQS_CLIENT],
         useFactory: (consumer: SqsWagerConsumer, client: SQSClient) => new ConsumerLifecycle(consumer, client) },
     ], exports: [SqsWagerConsumer] };
   }
   /** Publisher is independently deployable; the consumer and HTTP modules remain unchanged. */
-  static forPublisher(): DynamicModule {
+  static forPublisher(options: StandaloneMetricsOptions = {}): DynamicModule {
     const POLL = Symbol('OUTBOX_POLL');
-    return { module: MessagingModule, imports: [DatabaseModule.forRoot()], providers: [
+    return { module: MessagingModule, imports: [DatabaseModule.forRoot({ metrics: options.metrics })], providers: [
       { provide: CLOCK, useFactory: () => new SystemClock() },
       { provide: CONFIG, useFactory: () => workerConfig() },
       { provide: POLL, useFactory: () => {
@@ -54,9 +57,9 @@ export class MessagingModule {
           try { return await AwsSqsOutboxTransport.connect(client, config.sqsSendTimeoutMs, process.env['SQS_EVENTS_QUEUE_NAME']); }
           catch (error) { client.destroy(); throw error; }
         } },
-      { provide: OutboxPublisher, inject: [FINANCIAL_UNIT_OF_WORK, AwsSqsOutboxTransport, CLOCK, CONFIG],
-        useFactory: (uow: FinancialUnitOfWork, transport: AwsSqsOutboxTransport, clock: ClockPort, config: WorkerConfig) =>
-          new OutboxPublisher(uow, transport, clock, config, { workerId: process.env['OUTBOX_WORKER_ID'] ?? `outbox-${process.pid}-${randomUUID()}`, operationalLog: stderrOperationalLog }) },
+      { provide: OutboxPublisher, inject: [FINANCIAL_UNIT_OF_WORK, AwsSqsOutboxTransport, CLOCK, CONFIG, OPERATIONAL_METRICS],
+        useFactory: (uow: FinancialUnitOfWork, transport: AwsSqsOutboxTransport, clock: ClockPort, config: WorkerConfig, metrics: OperationalMetricsCollector) =>
+          new OutboxPublisher(uow, transport, clock, config, { workerId: process.env['OUTBOX_WORKER_ID'] ?? `outbox-${process.pid}-${randomUUID()}`, operationalLog: stderrOperationalLog, operationalMetrics: metrics }) },
       { provide: PublisherLifecycle, inject: [OutboxPublisher, SQS_CLIENT, POLL],
         useFactory: (publisher: OutboxPublisher, client: SQSClient, pollMs: number) => new PublisherLifecycle(publisher, client, pollMs) },
     ], exports: [OutboxPublisher] };

@@ -1,6 +1,6 @@
 import type { FinancialUnitOfWork } from '../../../shared/application/financial-store';
 import type { ClockPort } from '../../../shared/application/clock';
-import { PersistenceInvariantError } from '../../../shared/application/application-errors';
+import { PersistenceInvariantError, sqlError } from '../../../shared/application/application-errors';
 import { execution, exhausted, isTransient, retryDelay, type ExecutionOptions } from '../../../shared/application/execution';
 import { internalId } from '../../../shared/application/identifiers';
 import { dateCopy } from '../../../shared/domain/validation';
@@ -14,10 +14,11 @@ import { WagerTransactionProcessed } from '../domain/events/wager-transaction-pr
 import { WagerTransactionRejected } from '../domain/events/wager-transaction-rejected';
 import { nextReferenceRetry, pendingReferencePolicy, validatePendingReferencePolicy, type PendingReferencePolicy } from './pending-reference-policy';
 import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
+import { operationalMetricsEmitter, type OperationalMetricsOptions } from '../../../shared/application/operational-metrics';
 
 export interface PendingCandidate { readonly id: string; readonly walletId: string }
 export interface PendingResolution { readonly transactionId: string; readonly action: 'processed' | 'rejected' | 'rescheduled' | 'noop' | 'retry' }
-export interface PendingWorkerOptions extends Omit<ExecutionOptions, 'now'>, OperationalLoggingOptions {
+export interface PendingWorkerOptions extends Omit<ExecutionOptions, 'now'>, OperationalLoggingOptions, OperationalMetricsOptions {
   readonly diagnose?: (event: { readonly component: 'pending-reference-worker'; readonly code: string; readonly transactionId?: string }) => void;
 }
 export class PendingReferenceWorker {
@@ -25,11 +26,13 @@ export class PendingReferenceWorker {
   private readonly policy: PendingReferencePolicy;
   private readonly diagnose: NonNullable<PendingWorkerOptions['diagnose']>;
   private readonly observe;
+  private readonly emitMetric;
   constructor(private readonly uow: FinancialUnitOfWork, private readonly clock: ClockPort,
     policy: PendingReferencePolicy = pendingReferencePolicy(), options: PendingWorkerOptions = {}) {
     this.policy = validatePendingReferencePolicy(policy);
     this.runtime = execution({ ...options, now: () => this.clock.now() });
     this.observe = operationalEmitter(options.operationalLog);
+    this.emitMetric = operationalMetricsEmitter(options.operationalMetrics);
     this.diagnose = options.diagnose ?? (event => console.log(JSON.stringify(event)));
   }
   async runOnce(limit = 100, signal?: AbortSignal): Promise<PendingResolution[]> {
@@ -110,10 +113,18 @@ export class PendingReferenceWorker {
         if (result.action !== 'noop') this.observe({ component: 'pending-reference-worker',
           event: result.action === 'rescheduled' ? 'pending_reference_rescheduled' : 'pending_reference_resolved',
           transactionId, walletId, status: result.action });
+        if (result.action === 'processed' || result.action === 'rejected' || result.action === 'rescheduled') {
+          this.emitMetric({ type: 'pending-reference-resolution', action: result.action });
+        }
         return result;
       } catch (error) {
         if (!isTransient(error)) throw error;
+        const code = sqlError(error).code;
+        if (code === '40P01' || code === '40001' || code === '55P03' || code === '57014') {
+          this.emitMetric({ type: 'concurrency-conflict', code });
+        }
         if (attempt + 1 >= this.runtime.maxAttempts) throw exhausted(error);
+        this.emitMetric({ type: 'retry-scheduled', target: 'pendingReference' });
         await retryDelay(attempt); // A new UoW context on every transaction attempt.
       }
     }

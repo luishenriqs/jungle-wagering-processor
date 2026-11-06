@@ -9,10 +9,12 @@ import { DatabaseModule } from './database/database.module';
 import { HttpExceptionFilter, HTTP_OPERATIONAL_LOGGING_OPTIONS } from './shared/infrastructure/http-exception.filter';
 import type { FinancialUnitOfWork } from './shared/application/financial-store';
 import { stderrOperationalLog } from './shared/infrastructure/structured-logger';
+import { MetricsHttpModule } from './shared/infrastructure/metrics.controller';
+import type { OperationalMetricsCollector } from './shared/application/operational-metrics';
 
-function httpModules(uow?: FinancialUnitOfWork, health?: HealthOptions) {
-  const database = DatabaseModule.forHttp(uow);
-  return [WalletsModule.register(database), WageringModule.forHttp(database), HealthHttpModule.register(database, health)];
+function httpModules(uow?: FinancialUnitOfWork, health?: HealthOptions, metrics?: OperationalMetricsCollector) {
+  const database = DatabaseModule.forHttp(uow, { metrics });
+  return [WalletsModule.register(database), WageringModule.forHttp(database), HealthHttpModule.register(database, health), MetricsHttpModule.register(database)];
 }
 const httpProviders = [
   { provide: HTTP_OPERATIONAL_LOGGING_OPTIONS, useValue: { operationalLog: stderrOperationalLog } },
@@ -33,7 +35,7 @@ class RegisteredHttpApplication extends HttpFoundation {}
 
 @Module({ imports: httpModules(), providers: httpProviders })
 export class AppModule extends HttpFoundation {
-  static register(options: { uow: FinancialUnitOfWork; health?: HealthOptions }) {
-    return { module: RegisteredHttpApplication, imports: httpModules(options.uow, options.health) };
+  static register(options: { uow: FinancialUnitOfWork; health?: HealthOptions; readonly metrics?: OperationalMetricsCollector | undefined }) {
+    return { module: RegisteredHttpApplication, imports: httpModules(options.uow, options.health, options.metrics) };
   }
 }

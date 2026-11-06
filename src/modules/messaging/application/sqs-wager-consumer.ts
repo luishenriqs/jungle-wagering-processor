@@ -8,6 +8,7 @@ import { classifyConsumerError } from './consumer-errors';
 import type { ReceivedWagerMessage, SqsConsumerTransport } from './sqs-transport';
 import { wagerRequest } from './wager-request';
 import { operationalEmitter, type OperationalLoggingOptions } from '../../../shared/application/operational-logging';
+import { operationalMetricsEmitter, type OperationalMetricsOptions } from '../../../shared/application/operational-metrics';
 
 export interface ConsumerDiagnostic {
   readonly component: 'sqs-consumer'; readonly action: string; readonly code: string;
@@ -18,10 +19,14 @@ export type ConsumerOutcome = { readonly action: 'acked'; readonly result: Proce
 export type WagerProcessor = Pick<ProcessWagerTransactionUseCase, 'execute'>;
 export class SqsWagerConsumer {
   private readonly observe;
+  private readonly emitMetric;
   constructor(private readonly processor: WagerProcessor, private readonly transport: SqsConsumerTransport,
     private readonly clock: ClockPort, private readonly config: ConsumerConfig,
     private readonly diagnose: (event: ConsumerDiagnostic) => void = event => console.log(JSON.stringify(event)),
-    options: OperationalLoggingOptions = {}) { this.observe = operationalEmitter(options.operationalLog); }
+    options: OperationalLoggingOptions & OperationalMetricsOptions = {}) {
+    this.observe = operationalEmitter(options.operationalLog);
+    this.emitMetric = operationalMetricsEmitter(options.operationalMetrics);
+  }
 
   async handle(message: ReceivedWagerMessage, stopSignal?: AbortSignal): Promise<ConsumerOutcome> {
     let result: ProcessWagerResult;
@@ -88,6 +93,7 @@ export class SqsWagerConsumer {
     try {
       await this.transport.retry(message.receiptHandle, stopSignal?.aborted ? 0 : consumerRetrySeconds(message.receiveCount, this.config));
       this.observe({ component: 'sqs-consumer', event: 'sqs_retry_scheduled', code, level: 'warn', ...context });
+      this.emitMetric({ type: 'retry-scheduled', target: 'sqsConsumer' });
     }
     catch { this.log('retry', 'VISIBILITY_FAILED', message); } // Original timeout/redrive remains effective.
     return { action: 'retry', code };
@@ -104,6 +110,7 @@ export class SqsWagerConsumer {
     catch { return this.defer(message, 'DLQ_ACK_FAILED', stopSignal, context); }
     this.log('dead-lettered', code, message);
     this.observe({ component: 'sqs-consumer', event: 'sqs_dead_lettered', code, level: 'warn', ...context });
+    this.emitMetric({ type: 'dlq-transfer-confirmed' });
     return { action: 'dead-lettered', code };
   }
   private log(action: string, code: string, message?: ReceivedWagerMessage): void {
