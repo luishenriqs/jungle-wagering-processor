@@ -1,294 +1,845 @@
-# Decisões de implementação — Distributed Wagering Processor
+# Architecture and Implementation Decisions — Distributed Wagering Processor
 
-Fonte normativa: [technical-challenge.md](technical-challenge.md); desenho aprovado: [Jungle-Architecture-v0.2.md](Jungle-Architecture-v0.2.md). Decisões posteriores aprovadas por Luís são registradas neste documento e nas evidências por pacote.
+**Language / Idioma:** [English](#english) | [Português](#português)
 
-## Estado da entrega — IMP-04 concluído
+---
 
-A implementação inclui API financeira, reconciliação, health checks, logs estruturados e métricas operacionais, além do domínio/persistência/mensageria dos IMP-01–03. GREEN-G1–G5 foram homologados; G6A validou cinco integrações sem migrations e quatro grafos DI reais, com nove negativos; G6B validou métricas após commit/rollback/retry em PostgreSQL isolado (`20/20` testes aprovados em `test/integration/operational-metrics.test.ts`, compondo `989` testes unitários em `27` arquivos e `216` testes de integração em `14` arquivos, totalizando `1.205` testes aprovados em `41` arquivos). A evidência consolidada da entrega está em [FINAL-DELIVERY-EVIDENCE.md](FINAL-DELIVERY-EVIDENCE.md); os relatórios históricos das etapas anteriores estão em [IMP-01-EVIDENCE.md](IMP-01-EVIDENCE.md), [IMP-02-EVIDENCE.md](IMP-02-EVIDENCE.md) e [IMP-03-EVIDENCE.md](IMP-03-EVIDENCE.md).
+<a id="english"></a>
 
-HTTP e SQS reutilizam ProcessWagerTransactionUseCase. MikroORM usa EntityManager transacional por tentativa e SQL parametrizado explícito para locks/claims. Money permanece decimal string/NUMERIC(18,2); não depende dos tipos monetários do ORM. Locks wallet → wager e unicidade SQL preservam concorrência entre processos, incluindo chaves repetidas em wallets distintas. Os detalhes abaixo conservam as decisões e o histórico dos pacotes: referências a implementação futura ou aprovação pendente descrevem o estado daquela etapa e são superadas por este fechamento.
+## English
 
-### FIX-D01/D02 — integridade monetária e overflow terminal
+### Normative References and Delivery Status
 
-Correções aprovadas nas revisões independentes FIX-D01-REV-01 e FIX-D02-REV-01, conforme autorização de Luís para consolidação/publicação. Validação estável: 991 unitários e 252 integrações; execução conjunta com 1.243 aprovados, zero falhas e 8.253 asserções, além de typecheck aprovado. Resultados atuais estão em [FIX-D01-D02-FINAL-EVIDENCE.md](FIX-D01-D02-FINAL-EVIDENCE.md); as contagens IMP-04 acima permanecem históricas.
+- **Normative Challenge Specification:** [`technical-challenge.md`](technical-challenge.md)
+- **Reviewed Baseline Architecture:** [`Jungle-Architecture-v0.2.md`](Jungle-Architecture-v0.2.md)
+- **Consolidated Delivery Evidence (`FIX-D01` + `FIX-D02`):** [`FIX-D01-D02-FINAL-EVIDENCE.md`](FIX-D01-D02-FINAL-EVIDENCE.md)
+- **PostgreSQL Monetary Finiteness Evidence (`FIX-D01`):** [`FIX-D01-EVIDENCE.md`](FIX-D01-EVIDENCE.md)
+- **IMP-04 Delivery Evidence:** [`FINAL-DELIVERY-EVIDENCE.md`](FINAL-DELIVERY-EVIDENCE.md)
+- **Historical Package Evidence:** [`IMP-01-EVIDENCE.md`](IMP-01-EVIDENCE.md), [`IMP-02-EVIDENCE.md`](IMP-02-EVIDENCE.md), [`IMP-03-EVIDENCE.md`](IMP-03-EVIDENCE.md)
 
-`Migration202611060001` sucede a migration inicial, preservada integralmente. Adiciona três CHECKs validados que excluem explicitamente NaN e ±Infinity das seis colunas NUMERIC monetárias: wallets.balance; wager_transactions.amount e recorded_balance_amount; wallet_ledger_entries.amount, balance_before e balance_after. O snapshot opcional continua aceitando NULL. NUMERIC(18,2) já rejeita infinidades pelo typmod, mas NaN exigia exclusão explícita. Dados legados inválidos abortam o UP inteiro, sem reparos de histórico nem DDL parcial. DOWN remove somente esses CHECKs, preserva dados e reabre D01; UP/DOWN/UP é exercitado em schema descartável. A validação exige locks/leitura das tabelas; custo em bases grandes não foi medido.
+**Current Verified Baseline:** All implementation packages (`IMP-01` through `IMP-04`) and post-audit hardening packages (`FIX-D01` and `FIX-D02`) are complete and verified with **1,243 passing tests** (`991` unit tests across `27` files + `252` integration tests across `15` files), **0 failures**, and **8,253 assertions**, plus `bun run typecheck` (`tsc --noEmit`).
 
-No PendingReferenceWorker, MoneyOverflowError lançado ao calcular um movimento válido de referência é tratado como limite permanente de representação da persistência: `PENDING_REFERENCE → FAILED`, código existente `INFRASTRUCTURE_PERMANENT`, snapshot do saldo observado e limpeza de nextRetryAt/expiresAt. Wallet calcula o movimento antes de mutar seu estado; o ramo retorna antes de updateWallet, ledger e enqueue. Somente a wager é atualizada, na mesma UoW sob locks Wallet → Wager, com uma linha afetada obrigatória. Outros erros continuam propagados; insuficiência em reversões conserva seu código de negócio. Referência válida após o TTL continua seguindo a Opção A; overflow não recebe código de referência inexistente.
+---
 
-FAILED é terminal e persistente: não volta à descoberta de pendências, resolve novamente como no-op e faz replay do saldo histórico mesmo se uma alteração posterior permitir acomodar o crédito. HTTP conserva 422 para replay FAILED e SQS conserva ACK para resultado histórico confirmado. Não se emite Processed, Rejected ou BalanceChanged nesse ramo; o enunciado não exige evento Failed. Log estruturado e diagnóstico MONEY_OVERFLOW ocorrem após commit. O catálogo de métricas permanece inalterado.
+### Table of Contents
 
-Os complementos REV-D02-01/02 usam PostgreSQL real: um AFTER trigger de teste aborta após UPDATE FAILED e INSERT de marcador, provando rollback de ambos; falhas nos checkpoints wager/beforeCommit também preservam todos os registros financeiros. Removida a falha, há uma única terminalização. Processos Bun independentes confirmam FAILED, encerram ORM/processo, reiniciam no mesmo schema e verificam descoberta vazia, no-op e replay histórico depois de nova movimentação. Não foram necessárias alterações adicionais de produção.
+1. [Architecture Overview](#1-architecture-overview)
+2. [Layer Organization](#2-layer-organization)
+3. [Domain Modeling](#3-domain-modeling)
+4. [Money and Decimal Precision](#4-money-and-decimal-precision)
+5. [Wallet Aggregate](#5-wallet-aggregate)
+6. [WagerTransaction Aggregate](#6-wagertransaction-aggregate)
+7. [Immutable Ledger (`WalletLedgerEntry`)](#7-immutable-ledger-walletledgerentry)
+8. [Transactional Inbox (`InboxMessage`)](#8-transactional-inbox-inboxmessage)
+9. [Transactional Outbox (`OutboxMessage` & `IntegrationEvent`)](#9-transactional-outbox-outboxmessage--integrationevent)
+10. [Unit of Work (`FinancialUnitOfWork` & `PostgresUnitOfWork`)](#10-unit-of-work-financialunitofwork--postgresunitofwork)
+11. [PostgreSQL Transactions and Isolation](#11-postgresql-transactions-and-isolation)
+12. [Pessimistic Locking and Lock Ordering](#12-pessimistic-locking-and-lock-ordering)
+13. [Persistent Idempotency and Canonical Hashing](#13-persistent-idempotency-and-canonical-hashing)
+14. [Distributed Concurrency](#14-distributed-concurrency)
+15. [Reversals and Out-of-Order References](#15-reversals-and-out-of-order-references)
+16. [PendingReferenceWorker and Terminal Overflow Handling (`FIX-D02`)](#16-pendingreferenceworker-and-terminal-overflow-handling-fix-d02)
+17. [SQS Consumer](#17-sqs-consumer)
+18. [OutboxPublisher](#18-outboxpublisher)
+19. [Retry, Backoff, and Dead-Letter Queue (DLQ)](#19-retry-backoff-and-dead-letter-queue-dlq)
+20. [Crash Recovery and Coordinated Shutdown](#20-crash-recovery-and-coordinated-shutdown)
+21. [Versioned Migrations, Constraints, and `NaN` Protection (`FIX-D01`)](#21-versioned-migrations-constraints-and-nan-protection-fix-d01)
+22. [Health Checks and Observability](#22-health-checks-and-observability)
+23. [Authentication and IdP Extension Point](#23-authentication-and-idp-extension-point)
+24. [Guarantee Responsibility Matrix and Trade-offs](#24-guarantee-responsibility-matrix-and-trade-offs)
+25. [Known Limitations and Historical Package Traceability](#25-known-limitations-and-historical-package-traceability)
 
-### API, autenticação e fronteiras de confiança
+---
 
-Controllers validam DTOs e encaminham aos casos de uso; não fazem operações financeiras diretamente. Rotas expostas: `POST /wallets` (`201 Created`), `GET /wallets/:walletId` (`200 OK`), `GET /wallets/:walletId/ledger` (`200 OK`, paginação por cursor `(createdAt, id)`), `POST /wallets/:walletId/reconciliation` (`200 OK`, corpo vazio), `POST /wagering/transactions` (`200 OK` para `PROCESSED`, `202 Accepted` para `PENDING_REFERENCE`, `422 Unprocessable Entity` para `REJECTED` de negócio, `409 Conflict` para colisão de `Idempotency-Key` ou `(providerId, externalTransactionId)` com payload divergente, `404 Not Found` para recursos inexistentes, `400 Bad Request` para contrato inválido e `503 Service Unavailable` para falha transitória esgotada), `GET /wagering/transactions/:transactionId` (`200 OK`), `GET /providers/:providerId/wagering/transactions/:externalTransactionId` (`200 OK`), `GET /health/live` (`200 OK`), `GET /health/ready` (`200 OK` / `503 Service Unavailable` verificando `PostgresHealthProbe` e `SqsHealthProbe` nas três filas FIFO) e `GET /metrics` (`200 OK`). Wager HTTP exige um único `Idempotency-Key`; canonicalização e hash SHA-256 são os mesmos do canal SQS. A reconciliação compara saldo materializado e soma exata do ledger sob `REPEATABLE READ` sem corrigir valores silenciosamente. Health expõe liveness/readiness sem dados sensíveis; falhas operacionais e `HttpExceptionFilter` usam códigos estáveis, `x-correlation-id` e logs JSON sanitizados via `stderrOperationalLog`.
+### 1. Architecture Overview
 
-Autenticação não foi implementada, conforme opção permitida pelo desafio para priorizar correção financeira. ProviderIdentityGuard é o ponto de extensão explícito e permite todas as requisições. Em uma implantação exposta, o desenho seria integrar Keycloak/Zitadel via OIDC: validar assinatura/JWKS, issuer, audience e expiração de access tokens; vincular claims confiáveis à identidade do provider e autorizar acesso à wallet antes do caso de uso. Não haveria tabela própria de senhas. Health permanece aberto; SQS é canal interno confiável, mas os campos de provider continuam sujeitos às validações de domínio. Esse desenho não representa autenticação já disponível.
+The Distributed Wagering Processor follows a modular Domain-Driven Design (DDD) and Ports-and-Adapters architecture built on **Bun 1.4.4**, **TypeScript 5.9.3 (strict)**, **NestJS 11.1.6**, **MikroORM 6.6.8**, **PostgreSQL 16.6**, and **AWS SQS (LocalStack 4.10.0)**.
 
-### Métricas operacionais e DI
+Both synchronous HTTP requests (`POST /wagering/transactions`) and asynchronous SQS messages (`wager-transactions.fifo`) converge into the same application use case: [`ProcessWagerTransactionUseCase`](src/modules/wagering/application/process-wager-transaction.use-case.ts). PostgreSQL is the authoritative coordinator for concurrency, idempotency, balance non-negativity, ledger immutability, and atomic Inbox/Outbox persistence. SQS FIFO ordering (`MessageGroupId`) is treated purely as a throughput optimization, never as a substitute for database locks or constraints.
 
-Um provider OPERATIONAL_METRICS por DatabaseModule fornece o mesmo coletor aos três casos financeiros e aos workers do grafo. Consultas recebem somente UoW. AppModule.register e as factories standalone aceitam coletor explícito; grafos padrão independentes criam instâncias independentes. GET /metrics devolve um snapshot JSON com scope process e cópias defensivas. Não existe agregação entre processos nem persistência das métricas.
+```mermaid
+flowchart LR
+  subgraph Ingress["Ingress Channels"]
+    HTTP["HTTP API\n(WalletsController / WageringController)"]
+    SQSIn["SQS FIFO Input\n(wager-transactions.fifo)"]
+    DLQ["SQS FIFO DLQ\n(wager-transactions-dlq.fifo)"]
+  end
 
-M1/M2 contam resultados originais/replays após confirmação da UoW; conflitos definitivos são classificados separadamente. M3 exige retry efetivamente programado; no Consumer, só após confirmação de visibilidade. M4 exige DLQ e ACK confirmados. M5 conta SQLSTATEs homologados por ocorrência, inclusive tentativa final; 23505 só nas constraints conhecidas. M6 exige completeOutbox confirmado e usa a mesma amostra de tempo enviada ao SQL; lag regressivo válido satura em zero e amostra inválida omite apenas a métrica. M7 mede duração monotônica, incluindo retries/backoff, antes dos observers finais; M8 conta divergência confirmada de reconciliação. Pending emite resolução somente para processed/rejected/rescheduled após confirmação.
+  subgraph App["Application Core & Standalone Workers"]
+    Consumer["SqsWagerConsumer\n(consume-wagers.ts)"]
+    UseCase["ProcessWagerTransactionUseCase\n& CreateWalletUseCase"]
+    PendingWorker["PendingReferenceWorker\n(resolve-pending-references.ts)"]
+    Publisher["OutboxPublisher\n(publish-outbox.ts)"]
+  end
 
-O emissor defensivo isola throws, rejeições e reentrância e não aguarda retornos assíncronos dos observers. Observers customizados executam sincronicamente até retornar; código que bloqueie a thread não pode ser preemptado pelo emissor. Labels têm cardinalidade fixa e contadores saturam em inteiro seguro. Transferências confirmadas de DLQ não representam tamanho atual da fila; lag representa idade na confirmação da publicação, não latência de consumo.
+  subgraph PG["PostgreSQL 16.6 (Single Atomic Transaction)"]
+    Tables["wallets\nwager_transactions\nwallet_ledger_entries\ninbox_messages\noutbox_messages"]
+  end
 
-### Evidência externa e isolamento
+  subgraph Egress["Egress Channel"]
+    SQSOut["SQS FIFO Events\n(wagering-events.fifo)"]
+  end
 
-G6A intercepta CoreORM.init para impedir ensureDatabase/ensureIndexes e verifica a configuração efetiva e identidade PostgreSQL via query read-only. Exige public vazio, bloqueia Migrator.up e intercepta a UoW antes do bootstrap dos loops. As sondas exercitam providers reais com estado financeiro em memória; filas SQS são reais e exclusivas. Contextos são sequenciais, totalmente fechados antes do próximo, com watchdog concluído. Filhos têm deadline e kill/join de contingência.
+  HTTP --> UseCase
+  SQSIn --> Consumer
+  Consumer -->|Permanent Error + ACK| DLQ
+  Consumer -->|Native Redrive| DLQ
+  Consumer --> UseCase
+  UseCase -->|PostgresUnitOfWork| Tables
+  PendingWorker -->|Wallet -> Wager Lock| Tables
+  Tables -->|FOR UPDATE SKIP LOCKED| Publisher
+  Publisher -->|At-Least-Once Event| SQSOut
+```
 
-G6B usa a migration versionada Migration202611040001 somente em schemas jungle_it_<uuid> do banco jungle_test; valida identidade e inventário antes de migrar e remove apenas os próprios schemas. Essa prova complementa G6A: testes sem migration não provam commit/rollback financeiro real. Nenhum mecanismo de isolamento de teste substitui a implementação de produção.
+---
 
-## Fundação e dependências
+### 2. Layer Organization
 
-NestJS `11.1.6` (`common`, `core` e `platform-express` alinhados), `reflect-metadata` `0.2.2` e RxJS `7.8.2` compõem o bootstrap mínimo. TypeScript `5.9.3` executa a verificação estática; `@types/bun` `1.3.3` fornece os contratos do runner. Bun `1.4.4` executa a aplicação, instala pacotes e roda os testes. Versões diretas exatas e o lockfile gerado evitam atualizações automáticas. No IMP-01, typecheck, 93 testes e inicialização/DI/fechamento NestJS sem socket passaram no executor. O bootstrap HTTP passou fora do sandbox, conforme evidência de Luís: `bun run check:bootstrap`, http://127.0.0.1:35221, HTTP 404 esperado, exit 0. O IMP-01 foi posteriormente aprovado e publicado no commit b1b17ea6f5e1f4b841e8fd880463b948019e0651.
+The codebase is partitioned into three strict concentric layers across bounded modules (`shared`, `wallets`, `wagering`, `messaging`, and `database`):
 
-O tsconfig mantém `strict`, `exactOptionalPropertyTypes` e as demais verificações de código. Segue-se a [recomendação oficial do Bun](https://bun.com/docs/runtime/typescript) de `skipLibCheck=true`: fontes, testes e scripts são verificados contra os tipos das bibliotecas, mas os arquivos `.d.ts` não são verificados internamente. A instalação resolveu bun-types `1.3.3` com @types/node `26.6.6` (a dependência transitiva de bun-types é `*`); a checagem completa das declarações revelou conflitos em `noDeprecation`, `EncodeIntoResult` e tipos TLS. A biblioteca DOM foi removida do tsconfig porque o alvo é Bun, que fornece os tipos web utilizados, sem frontend. Não houve edição de node_modules, redução de strict, remoção de testes ou alteração dos tipos financeiros. O trade-off é que a compatibilidade interna dos tipos transitivos permanece sem comprovação; uma futura atualização controlada deve alinhar esses pacotes.
+1. **Domain Layer (`src/**/domain/*`):**
+   - Contains pure business aggregates, value objects, domain events, and pure evaluation functions (`Money`, `Wallet`, `WalletLedgerEntry`, `WagerTransaction`, `evaluateWager`, `InboxMessage`, `OutboxMessage`, `IntegrationEvent`).
+   - Free of framework decorators, ORM metadata, SQL queries, or AWS SDK imports.
+2. **Application Layer (`src/**/application/*`):**
+   - Defines transactional use cases (`CreateWalletUseCase`, `ProcessWagerTransactionUseCase`, `GetWalletUseCase`, `ListWalletLedgerUseCase`, `ReconcileWalletUseCase`, `GetWagerTransactionUseCase`) and worker coordinators (`SqsWagerConsumer`, `OutboxPublisher`, `PendingReferenceWorker`).
+   - Depends only on domain objects and application ports (`FinancialUnitOfWork`, `FinancialStore`, `ClockPort`, `OperationalMetricsPort`, `OperationalLogPort`).
+3. **Infrastructure Layer (`src/database/*`, `src/**/infrastructure/*`, `scripts/*`):**
+   - Implements persistence (`PostgresUnitOfWork`, MikroORM `EntitySchema` definitions, `ExactNumericType`, versioned migrations), SQS transport (`AwsSqsConsumerTransport`, `AwsSqsOutboxTransport`, `localSqsClient`), health probes (`PostgresHealthProbe`, `HealthReadiness`), HTTP controllers, exception filters, and standalone CLI worker entrypoints.
 
-Não há CLI Nest, biblioteca de testes adicional ou dependência de infraestrutura no domínio. A composição de módulos está nas classes `*.module.ts`. A referência oficial para o bootstrap é [NestJS First steps](https://docs.nestjs.com/first-steps).
+---
 
-O bootstrap fecha a aplicação caso a abertura da porta falhe, antes de propagar o erro. O script de validação HTTP continua exigindo listen e uma resposta HTTP real; EPERM não é convertido em sucesso nem substituído por teste sem socket.
+### 3. Domain Modeling
 
-## Money
+All domain classes enforce state encapsulation and transition safety:
 
-`decimal.js` `10.6.0` é a biblioteca decimal já prevista na v0.2. Usa-se um construtor clonado, privado ao módulo, com precisão 40. Nenhum valor monetário é convertido para `number`. A soma/subtração de dois valores no limite NUMERIC(18,2) requer no máximo 19 dígitos; a precisão configurada comporta os cálculos sem arredondamento. Referência: [decimal.js API](https://mikemcl.github.io/decimal.js/).
+- **Private Constructors & Static Factories:** Every domain class uses a `private` (or `protected` on abstract `IntegrationEvent`) constructor and ECMAScript private fields (`#`). Object creation occurs through explicit factories (`Money.from`, `Wallet.open`, `WagerTransaction.create`, `WagerTransaction.createOpening`, `WalletLedgerEntry.create`, `InboxMessage.receive`, `OutboxMessage.enqueue`) that validate all invariants upfront.
+- **Rehydration Factories (`rehydrate`):** Persistence adapters reconstruct domain instances using `static rehydrate(state)`. Rehydration copies dates and freezes structures without re-executing business transitions, incrementing versions, or emitting new events.
+- **Defensive Copying & Immutability:** Domain instances are frozen via `Object.freeze`. All `Date` properties are cloned on input and in every getter. Event JSON payloads are deeply cloned and recursively frozen.
+- **Identifier Policy (`ARC2-02`):** Internal entity IDs (`walletId`, `transactionId`, `ledgerEntryId`, `eventId`) are lowercase UUIDs generated via `node:crypto.randomUUID()`. External identifiers (`playerId`, `providerId`, `externalTransactionId`, `referenceExternalTransactionId`, `idempotencyKey`, `roundId`, `gameId`, `messageId`) are validated non-empty trimmed `TEXT` strings (`wallets.player_id` and `wager_transactions.player_id` use `TEXT` in PostgreSQL).
 
-Contratos aceitam exatamente duas casas e até 16 dígitos inteiros, sem espaços, sinal, expoente, zeros iniciais redundantes ou separador local. Overflow é rejeitado antes de construir um decimal excessivamente longo. O limite absoluto, incluindo resultados internos negativos, é `9999999999999999.99`. `subtract` e `negate` podem produzir negativos; entradas externas, saldos e snapshots não podem.
+---
 
-`toString()` retorna somente o valor decimal fixo; `toJSON()` inclui moeda. Todas as operações binárias, inclusive igualdade e comparação, rejeitam moedas diferentes. A validação de moeda usa os códigos reconhecidos por `Intl.supportedValuesOf('currency')` no runtime fixado; não aplica quantidade variável de casas por moeda. BRL é a moeda operacional; USD também é exercitado nos testes. A lista depende dos dados ICU do runtime, razão para fixar Bun.
+### 4. Money and Decimal Precision
 
-## Encapsulamento e reidratação
+[`Money`](src/shared/domain/money.ts) encapsulates exact decimal monetary amounts using a dedicated `Decimal.clone({ precision: 40 })` constructor from `decimal.js` `10.6.0`:
 
-Classes usam construtores privados, factories e campos privados ECMAScript (`#`). Instâncias são congeladas; campos privados mutáveis só mudam pelos métodos de transição. Datas são copiadas na entrada e em cada getter. Money não expõe o objeto Decimal interno. Payloads JSON são copiados e congelados recursivamente, inclusive arrays.
+- **Zero Floating-Point Representation:** Monetary amounts are never converted to JavaScript `number` in domain, application, or persistence code. [`ExactNumericType`](src/database/exact-numeric-type.ts) rejects JS `number` values at the MikroORM driver boundary and maps PostgreSQL `NUMERIC(18,2)` columns strictly as decimal strings.
+- **Strict Format & Range Validation:** External inputs must match `/^(?:0|[1-9]\d{0,15})\.\d{2}$/` (exact scale of 2 decimal places, up to 16 integer digits, no sign prefix, no leading zeroes, no whitespace, no scientific notation, no `NaN` or `Infinity`).
+- **Maximum Supported Value:** `9999999999999999.99` (`NUMERIC(18,2)` ceiling). Any addition or subtraction exceeding this bound throws [`MoneyOverflowError`](src/shared/domain/domain-errors.ts).
+- **Currency Safety:** Currency codes are validated against ISO-4217 codes supported by `Intl.supportedValuesOf('currency')` in the pinned Bun runtime (`BRL` is the primary currency; `USD` and cross-currency rejection are exercised across unit and integration suites). Binary operations (`add`, `subtract`, `isLessThan`, `equals`) throw [`CurrencyMismatchError`](src/shared/domain/domain-errors.ts) when currencies differ.
 
-Factories `rehydrate` recebem estados confiáveis da futura persistência. Copiam estruturas/datas, mas não reexecutam transições de negócio, abertura, créditos, débitos ou emissão de eventos. Não substituem constraints do banco nem validam retrospectivamente todas as regras de negócio.
+---
 
-## Wallet, ledger e abertura
+### 5. Wallet Aggregate
 
-`Wallet.open` retorna uma Wallet. Abertura positiva exige identidades do lançamento e da transação e expõe o lançamento em `openingEntry`; zero não cria lançamento. A versão inicial é sempre 1.
+[`Wallet`](src/modules/wallets/domain/wallet.ts) is the aggregate root and concurrency boundary for a `(playerId, currency)` pair:
 
-`debit`/`credit` recebem valor, instante e identidades de transação/ledger e retornam `WalletLedgerEntry`. O método calcula e valida o lançamento inteiro antes de atribuir saldo, versão e timestamp. Valores zero não são movimentos válidos; LOSS não chama esses métodos. Não há setter público de saldo nem histórico usado como garantia de idempotência.
+- **Opening (`Wallet.open` & `createWalletOpening`):** Initializes `version = 1`. If `initialBalance` is positive, [`createWalletOpening`](src/modules/wagering/domain/wallet-opening.ts) atomically builds the `Wallet`, an internal `OPENING` `WagerTransaction` (already `PROCESSED`, with `providerId = "SYSTEM"`, `externalTransactionId = "opening:<walletId>"`, `idempotencyKey = "SYSTEM:opening:<walletId>"`, `gameId = "SYSTEM_OPENING"`), a `CREDIT` `WalletLedgerEntry`, and two Outbox events (`WagerTransactionProcessed` and `WalletBalanceChanged`). If `initialBalance` is `0.00`, only the `Wallet` row is created.
+- **Balance Movements (`debit` and `credit`):** Both methods validate currency match and positive movement amount, compute the new balance and the `WalletLedgerEntry` **before** mutating private state (`#balance`, `#version`, `#updatedAt`), and increment `version` by `1`. If a debit exceeds `#balance`, `debit` throws with the caller-supplied `FailureCode` (`INSUFFICIENT_FUNDS_BET` or `INSUFFICIENT_FUNDS_REVERSAL`); if a credit exceeds `NUMERIC(18,2)`, `Money.add` throws `MoneyOverflowError` before any field on `Wallet` is modified.
 
-`createWalletOpening` é uma factory pura que reúne Wallet, transação OPENING já PROCESSED, ledger e os dois eventos. Não é um caso de uso transacional. Abertura positiva gera `WagerTransactionProcessed` e `WalletBalanceChanged` na versão 1; zero não gera nenhum desses artefatos. Os eventIds precisam ser distintos. Metadata interna segue a v0.2: provider `SYSTEM`, external/round `opening:<walletId>`, key `SYSTEM:opening:<walletId>` e game `SYSTEM_OPENING`.
+---
 
-IDs, tempo, correlação e hash são fornecidos pelo chamador para permitir determinismo. A factory não calcula hash de transporte nem oferece garantia global de unicidade. A persistência futura deverá salvar o bundle completo em uma única transação.
+### 6. WagerTransaction Aggregate
 
-## WagerTransaction
+[`WagerTransaction`](src/modules/wagering/domain/wager-transaction.ts) models the lifecycle and audit snapshot of every wagering operation:
 
 ```text
 PENDING           -> PROCESSED | PENDING_REFERENCE | REJECTED | FAILED
 PENDING_REFERENCE -> PROCESSED | REJECTED | FAILED
-PROCESSED / REJECTED / FAILED -> nenhuma transição
+PROCESSED / REJECTED / FAILED -> Terminal (no further transitions allowed)
 ```
 
-`create` é a entrada externa: rejeita OPENING e provider SYSTEM. `createOpening` é a factory interna. REFUND/ROLLBACK exigem referência; WIN pode tê-la; BET e LOSS rejeitam referências (VAL01-02). Referência a si mesmo é inválida. `markProcessed` também rejeita referência interna quando não há referência externa admitida. `reschedulePendingReference(nextRetryAt)` incrementa attempts somente em PENDING_REFERENCE, exige avanço do próximo instante antes do deadline e preserva snapshot/expiração (VAL01-01). O worker permanece no IMP-03.
+- **External vs Internal Creation:** `WagerTransaction.create` rejects `kind === "OPENING"` and `providerId === "SYSTEM"`. `BET` and `LOSS` reject `referenceExternalTransactionId`; `REFUND` and `ROLLBACK` require `referenceExternalTransactionId`; `WIN` accepts an optional `referenceExternalTransactionId`. Self-reference (`referenceExternalTransactionId === externalTransactionId`) is rejected.
+- **Historical Balance Snapshot (`recordedBalance`):** `markProcessed`, `reject`, `markPendingReference`, and `fail` record the wallet balance observed at evaluation time (`recorded_balance_amount` and `recorded_balance_currency`). On `CURRENCY_MISMATCH` rejection, `money` preserves the submitted transaction currency while `recordedBalance` preserves the actual wallet currency. Terminal snapshots are immutable.
+- **Failure Taxonomy (`FailureCode`):**
 
-`markProcessed` e `reject` exigem o snapshot do saldo. `markPendingReference` exige snapshot e agenda inicial; `fail` registra código terminal. Snapshots de terminais não podem ser substituídos. `requiresReference` significa exigência por kind; `expectsReference` também considera WIN com referência opcional fornecida. `ledgerDirectionFor` retorna `undefined` para LOSS.
+| `FailureCode` | Terminal Status | Meaning |
+|---|---|---|
+| `INSUFFICIENT_FUNDS_BET` | `REJECTED` | `BET` amount exceeds current wallet balance |
+| `INSUFFICIENT_FUNDS_REVERSAL` | `REJECTED` | `ROLLBACK` debit (reverting `WIN` or `REFUND`) exceeds current wallet balance |
+| `CURRENCY_MISMATCH` | `REJECTED` | Operation currency does not match wallet currency |
+| `REFERENCE_NOT_FOUND_TIMEOUT` | `REJECTED` | Referenced transaction remained unavailable past `maxAttempts` or `TTL` |
+| `REFERENCE_INVALID_KIND` | `REJECTED` | Referenced transaction `kind` is incompatible with `WIN`, `REFUND`, or `ROLLBACK` |
+| `REFERENCE_CONTEXT_MISMATCH` | `REJECTED` | Referenced transaction belongs to a different player, wallet, round, or currency |
+| `REFERENCE_AMOUNT_MISMATCH` | `REJECTED` | `REFUND` or `ROLLBACK` amount differs from the referenced transaction amount |
+| `REFERENCE_NOT_PROCESSED` | `REJECTED` | Referenced transaction is in a non-`PROCESSED` terminal state (`REJECTED` or `FAILED`) |
+| `REFERENCE_ALREADY_REVERSED` | `REJECTED` | Referenced transaction already has a processed `REFUND`/`ROLLBACK` reversal |
+| `INFRASTRUCTURE_PERMANENT` | `FAILED` | Permanent infrastructure/representation failure (such as `NUMERIC(18,2)` overflow during `PENDING_REFERENCE` resolution) |
 
-`evaluateWager` é uma função pura: valida wallet, saldo/moeda, referência e insuficiência. Não altera entidades, não busca dados e não mantém mapas. Para REFUND/ROLLBACK, exige valor igual e contexto provider/player/wallet/round/currency correspondente. WIN pode ter valor diferente. ROLLBACK de BET credita; de WIN/REFUND debita. Referências inexistentes ou válidas ainda não terminais aguardam; referências rejeitadas/falhas não podem ser aplicadas.
+---
 
-Uma referência só pode ter uma reversão processada do conjunto REFUND/ROLLBACK. WIN sobre BET já revertida também é rejeitada. O chamador fornece `referenceAlreadyReversed` a partir do banco sob o futuro lock da wallet. A função verifica esse fato, mas não o garante persistentemente. A cadeia BET -> REFUND -> ROLLBACK(ref REFUND) é permitida porque a última operação referencia outro lançamento.
+### 7. Immutable Ledger (`WalletLedgerEntry`)
 
-`matchesPayload` compara hashes; `assertReplay` também verifica provider, external ID e key. Não armazena deduplicação em memória. Canonicalização, consultas por unicidade e replay HTTP/SQS pertencem aos casos de uso futuros. Não se retorna o saldo atual para substituir o snapshot histórico.
+[`WalletLedgerEntry`](src/modules/wallets/domain/wallet-ledger-entry.ts) is an append-only financial record with no mutable fields and no state transition methods:
 
-## Códigos e erros
+- `WalletLedgerEntry.create` verifies that `money.isPositive()`, that `money`, `balanceBefore`, and `balanceAfter` share the same currency, and that `isBalanced()` holds (`balanceBefore + money == balanceAfter` for `CREDIT`; `balanceBefore - money == balanceAfter` for `DEBIT`).
+- Every financial wager (`BET`, `WIN`, `REFUND`, `ROLLBACK`, `OPENING`) that reaches `PROCESSED` produces exactly one `WalletLedgerEntry` (`uq_ledger_transaction`).
+- Non-movement operations (`LOSS`) and non-`PROCESSED` wagers (`PENDING_REFERENCE`, `REJECTED`, `FAILED`) never produce ledger entries.
 
-| FailureCode | Significado |
-|---|---|
-| INSUFFICIENT_FUNDS_BET | Débito de aposta excede saldo |
-| INSUFFICIENT_FUNDS_REVERSAL | Débito de reversão excede saldo |
-| CURRENCY_MISMATCH | Moedas incompatíveis |
-| REFERENCE_NOT_FOUND_TIMEOUT | Esgotamento da espera pela referência; atribuído pelo worker futuro |
-| REFERENCE_INVALID_KIND | Tipo de referência não permitido |
-| REFERENCE_CONTEXT_MISMATCH | Identidade ou contexto de referência incompatível |
-| REFERENCE_AMOUNT_MISMATCH | Reversão parcial ou valor divergente |
-| REFERENCE_NOT_PROCESSED | Referência terminal que não foi processada |
-| REFERENCE_ALREADY_REVERSED | Reversão anterior impede nova aplicação |
-| INFRASTRUCTURE_PERMANENT | Falha permanente auditável que terminaliza como FAILED |
+---
 
-O código adicional `INFRASTRUCTURE_PERMANENT` distingue FAILED de rejeição financeira. Conflitos de idempotência são `IdempotencyConflictError`, não uma nova transação rejeitada. `InvalidTransactionStateError` indica erro de programação nas transições. Erros de valor, overflow, ledger e estado de mensagem têm classes específicas. O mapeamento HTTP não está implementado neste pacote.
+### 8. Transactional Inbox (`InboxMessage`)
 
-## Eventos e mensageria
+[`InboxMessage`](src/modules/messaging/domain/inbox-message.ts) provides persistent deduplication for SQS deliveries keyed by `(consumer_name, message_id)`:
 
-Os quatro eventos têm versão 1 fixa e aggregateId igual a walletId, alinhado ao agrupamento futuro por wallet. O envelope contém eventId, eventType, version, aggregateId, correlationId, causationId opcional, occurredAt ISO-8601 e data JSON. Dados monetários são MoneyProps, nunca Money. Factories rejeitam estados incompatíveis; o evento de saldo exige um ledger correspondente ao saldo observado da wallet.
+- Claimed inside the same PostgreSQL transaction as the financial operation via `INSERT INTO inbox_messages ... ON CONFLICT (consumer_name, message_id) DO NOTHING RETURNING *`.
+- Stores `payload_hash` (the canonical SHA-256 hash of the business wager payload) and `processed_at`.
+- If a duplicate `(consumer_name, message_id)` arrives with a different `payload_hash`, `assertSamePayload` throws `IdempotencyConflictError`.
+- If a redelivery arrives with a new `message_id` for an already-committed `idempotency_key`, the new `InboxMessage` row is marked `processed_at` and committed in the same transaction while returning the idempotent replay of the winning wager without duplicating financial movements or Outbox events.
 
-Inbox preserva a primeira data de processamento em chamadas repetidas. Comparar um hash divergente lança conflito. Isso é proteção de estado local, não unicidade persistente.
+---
 
-Outbox usa eventId como id e persiste o envelope completo. Enfileiramento nasce pendente, com attempts 0 e nextAttemptAt igual a occurredAt. Retry número n usa `min(maxDelayMs, baseDelayMs * 2^(n-1))`, sendo o primeiro n=1. Defaults: base 1000 ms, teto 60000 ms. Política é configurável por instância e copiada defensivamente; na reidratação, o chamador deve aplicar a mesma configuração de processo. Não há jitter para manter determinismo; o teto limita o intervalo, não a quantidade de tentativas. Nenhum evento é descartado por esgotamento. Publicação é terminal para os métodos locais.
+### 9. Transactional Outbox (`OutboxMessage` & `IntegrationEvent`)
 
-Claims, leases, fencing, envio SQS e confirmação concorrente permanecem no IMP-03. A classe Outbox não autoriza publicação antes do commit.
+[`IntegrationEvent`](src/shared/domain/events/integration-event.ts) and [`OutboxMessage`](src/modules/messaging/domain/outbox-message.ts) guarantee that integration events are never published before database commit and are never lost if a process crashes after commit:
 
-## Pendências dos próximos pacotes
+- **Concrete Event Subclasses (`version = 1`, `aggregateId = walletId`):**
+  1. [`WagerTransactionProcessed`](src/modules/wagering/domain/events/wager-transaction-processed.ts) — emitted when any wager (including `LOSS` and positive `OPENING`) transitions to `PROCESSED`.
+  2. [`WagerTransactionRejected`](src/modules/wagering/domain/events/wager-transaction-rejected.ts) — emitted when a wager transitions to `REJECTED`.
+  3. [`WalletBalanceChanged`](src/modules/wallets/domain/events/wallet-balance-changed.ts) — emitted **only** when the wallet balance changes (`BET`, `WIN`, `REFUND`, `ROLLBACK`, positive `OPENING`).
+  4. [`WagerTransactionPendingReference`](src/modules/wagering/domain/events/wager-transaction-pending-reference.ts) — emitted once when a wager is initially accepted as `PENDING_REFERENCE`.
+- `OutboxMessage` uses `eventId` as its primary key (`id`), persists the serialized JSON envelope (`MoneyProps` strings, never `Money` instances), starts with `attempts = 0` and `nextAttemptAt = occurredAt`, and computes deterministic exponential backoff on retry: `min(maxDelayMs, baseDelayMs * 2^(attempts - 1))` (defaults: `baseDelayMs = 1000` ms, `maxDelayMs = 60000` ms). Outbox messages are never discarded due to attempt exhaustion.
 
-IMP-02 implementou MikroORM, NUMERIC(18,2), migrations reversíveis, constraints, proteção de ledger/terminais, unicidades, locks wallet-first e persistência transacional de Inbox/Outbox. IMP-03 implementou seus protocolos operacionais, workers, recovery, ACK/Retry/DLQ e shutdown. IMP-04 deverá implementar API e observabilidade; não foi iniciado neste fechamento.
+---
 
-Autenticação não está implementada; o ponto de extensão ProviderIdentityPort/guard no-op documentado na v0.2 será tratado na borda HTTP em IMP-04. Não existem endpoints financeiros que precisem desse ponto de extensão no IMP-01.
+### 10. Unit of Work (`FinancialUnitOfWork` & `PostgresUnitOfWork`)
 
-## IMP-02 — Persistência e concorrência
+[`FinancialUnitOfWork`](src/shared/application/financial-store.ts) and its PostgreSQL implementation [`PostgresUnitOfWork`](src/database/postgres-unit-of-work.ts) isolate each transaction attempt:
 
-**Estado: APROVADO para fechamento e versionamento por Luís Henrique Pereira.** Revisão independente do Antigravity: **APROVAR COM RECOMENDAÇÕES NÃO BLOQUEANTES**. PostgreSQL 16.6 real validado: 165 testes aprovados, 0 falhas, 985 asserções, 17 arquivos; concorrência com três processos Bun independentes, TypeScript strict, bootstrap NestJS + MikroORM e diff-check aprovados na validação independente informada pelo responsável técnico. Consulte IMP-02-EVIDENCE.md para proveniência e resultados locais separados. O IMP-03 foi posteriormente implementado e validado funcionalmente, conforme seção própria abaixo; revisão independente e aprovação humana do IMP-03 pendentes.
+- Every call to `uow.run(work, options)` creates a clean MikroORM `EntityManager` fork (`orm.em.fork({ clear: true })`) and executes inside `em.transactional(..., { isolationLevel })`.
+- [`PostgresFinancialStore`](src/database/postgres-financial-store.ts) executes explicit parameterized SQL statements against the transactional `SqlEntityManager` rather than relying on implicit ORM identity-map flush ordering. This makes lock acquisition order, constraint violation classification, and row-count assertions (`updateWallet`, `updatePendingWager`, `completeOutbox`, `failOutbox`) completely deterministic.
 
-### Identificadores — ARC2-02
+---
 
-IDs internos de Wallet, WagerTransaction, ledger e Outbox são UUIDs gerados pela aplicação com `node:crypto.randomUUID()`; FKs internas também usam UUID. EventId é o próprio ID da Outbox e não é regenerado em replay. IDs válidos já recebidos não ficam limitados à versão 4.
+### 11. PostgreSQL Transactions and Isolation
 
-**playerId é externo e não é validado como UUID. `wallets.player_id` e `wager_transactions.player_id` usam TEXT**, conforme decisão explícita de Luís, que substitui os tipos UUID dessas duas colunas no DDL v0.2. Provider/external transaction ID, referências externas, key, round/game e identidade da Inbox são TEXT. Preserva-se a grafia do identificador externo; walletId, que identifica um recurso interno, é validado e normalizado para UUID minúsculo antes do hash.
+- **Write Operations (`CreateWalletUseCase`, `ProcessWagerTransactionUseCase`, `PendingReferenceWorker`, `OutboxPublisher`):** Execute under PostgreSQL `READ COMMITTED` isolation combined with explicit pessimistic `FOR UPDATE` locks. Because `Wallet` is locked first via `SELECT ... FROM wallets WHERE id = ? FOR UPDATE`, PostgreSQL re-reads the latest committed row version upon acquiring the lock, preventing lost updates and write skew on the wallet balance.
+- **Reconciliation (`ReconcileWalletUseCase`):** Executes under `REPEATABLE READ` isolation (`IsolationLevel.REPEATABLE_READ`) so that reading `wallets.balance` and aggregating `SUM(wallet_ledger_entries)` observe a single consistent MVCC snapshot without blocking concurrent writers.
+- **Transient Fault Retries (`execution.ts`):** Deadlocks (`40P01`), serialization failures (`40001`), lock timeouts (`55P03`), statement timeouts (`57014`), and transient connection errors abort the current transaction completely, wait outside any transaction (`retryDelay`), and retry in a fresh `EntityManager` fork up to `maxAttempts` (`3` by default).
 
-Domínio continua recebendo strings; fixtures unitárias existentes não foram convertidas para UUID. Integração usa UUIDs internos reais e inclui player-test-01 e playerIds em formato UUID.
+---
 
-### MikroORM e fronteira de persistência
+### 12. Pessimistic Locking and Lock Ordering
 
-Instalados `@mikro-orm/{core,postgresql,migrations}` 6.6.8 e `@mikro-orm/nestjs` 6.1.1. O [manifesto oficial do adapter Nest](https://github.com/mikro-orm/nestjs/blob/v6.1.1/package.json) admite MikroORM 6 e NestJS 11. A instalação inicial foi bloqueada por DNS; Luís a executou externamente e o agente confirmou versões, lockfile atualizado e frozen install offline sem alterações. A integração SQL foi posteriormente aprovada externamente pelo responsável técnico e na revisão independente. O driver já fornece pg transitivamente; nenhuma dependência direta pg adicional foi introduzida.
+To prevent deadlocks across concurrent HTTP workers, SQS consumers, and `PendingReferenceWorker` instances, every financial write transaction enforces a strict lock hierarchy (`ARC2-01`):
 
-EntitySchemas e records estão em src/database, separados do domínio. `ExactNumericType` recusa números JS; campos monetários são strings decimais no driver/mappers. Toda reconstrução usa rehydrate. Não há version decorator; Wallet.version é manual.
+1. **Pre-Lock Identity Read (Lock-Free):** `findIdentity(idempotencyKey, providerId, externalTransactionId)` checks if the key or external transaction ID is already committed. This ensures an already-used key with a mismatched payload or non-existent target wallet immediately raises `IdempotencyConflictError`.
+2. **Lock 1 — `Wallet FOR UPDATE`:** `SELECT ... FROM wallets WHERE id = ? FOR UPDATE` is always the **first** row lock acquired in any financial transaction.
+3. **Lock 2 — `Inbox Claim` (SQS channel only):** `INSERT INTO inbox_messages ... ON CONFLICT DO NOTHING RETURNING *` runs immediately after locking the wallet and before locking or inserting wagers.
+4. **Lock 3 — `Wager / Same-Wallet Reference FOR UPDATE`:**
+   - In `ProcessWagerTransactionUseCase`: if a referenced wager exists and belongs to the **same** wallet (`reference.walletId === wallet.id`), it is locked via `SELECT ... FROM wager_transactions WHERE id = ? FOR UPDATE`.
+   - In `PendingReferenceWorker`: after locking `Wallet FOR UPDATE` and verifying ownership, the candidate wager is locked (`getWager(id, true)`), followed by the referenced wager (`getWager(ref.id, true)`) **only if** `ref.walletId === wallet.id`.
+5. **Zero Cross-Wallet Locks:** An operation never locks a second wallet or a wager belonging to another wallet. If a reference belongs to another wallet, `evaluateWager` rejects it as `REFERENCE_CONTEXT_MISMATCH` using the lock-free read.
 
-A porta FinancialUnitOfWork oferece uma transação e um FinancialStore por tentativa. PostgresUnitOfWork usa fork limpo e `EntityManager.transactional`, com SQL parametrizado no SqlEntityManager transacional. Os comandos explícitos tornam a ordem de bloqueios e escritas verificável, sem depender de flush automático. EntitySchemas descrevem os registros, enquanto a migration versionada é a autoridade para constraints, índices e triggers; não se usa schema update em execução. Referência: [transações MikroORM 6.6](https://mikro-orm.io/docs/6.6/transactions).
+---
 
-DatabaseModule registra MikroORM e os seis casos de uso por factories Nest. A composição ativa a conexão quando DATABASE_URL está configurada; o bootstrap sem banco continua disponível para o estágio de fundação. Não são criados endpoints financeiros neste pacote.
+### 13. Persistent Idempotency and Canonical Hashing
 
-### Schema e atomicidade
+- **Canonical Payload Hash (`wager-payload.ts`):** [`canonicalWagerPayload`](src/modules/wagering/application/wager-payload.ts) normalizes `money` via `Money.from(input.money).toJSON()`, normalizes missing `referenceExternalTransactionId` to `null`, sorts all JSON object keys lexicographically at every nesting level, and computes a lowercase hex `SHA-256` digest (`wagerPayloadHash`). Transport metadata (`Idempotency-Key` header name, `correlationId`, SQS `messageId`, `occurredAt`, `ReceiptHandle`) is excluded from the hash.
+- **Dual Uniqueness Authorities:** PostgreSQL enforces `uq_wager_idempotency` (`UNIQUE (idempotency_key)`) and `uq_wager_provider_external` (`UNIQUE (provider_id, external_transaction_id)`).
+- **Replay vs Conflict:**
+  - If an incoming request matches an existing committed wager on **all** of `idempotencyKey`, `providerId`, `externalTransactionId`, and `payloadHash`, `assertReplay` succeeds and the use case returns the persisted `recordedBalance`, `status`, and `failureCode` with `idempotentReplay: true`.
+  - If `idempotencyKey` and `(providerId, externalTransactionId)` match two different rows, or if any of `providerId`, `externalTransactionId`, `idempotencyKey`, or `payloadHash` diverges from the committed winner, `IdempotencyConflictError` (`409 Conflict`) is thrown without mutating any wallet.
 
-PostgreSQL 16.6 em Compose, volume nomeado Jungle para desenvolvimento, instância separada jungle_test em tmpfs e portas configuráveis. Cada suíte de integração cria e remove somente seu próprio schema jungle_it_<uuid> no banco jungle_test; o helper recusa URLs de outro banco. A migration down destrói somente o schema selecionado e exige autorização explícita no script para uso manual.
+---
 
-A migration cria as cinco tabelas previstas e inclui as unicidades de wallet, key, provider/external ID, ledger e reversões processadas. Ledger é append-only por trigger. Wagers terminais são imutáveis inclusive em DELETE; identidade de wagers não terminais também é protegida. Estados/tipos, valor positivo exceto LOSS, referências obrigatórias/inesperadas, failureCode e snapshots obrigatórios são protegidos no banco. FAILED exige snapshot e código na persistência; `fail(code,balance?)` permite fornecer o saldo observado sem quebrar os contratos unitários anteriores.
+### 14. Distributed Concurrency
 
-Triggers de constraint diferidos verificam no commit que saldo é igual à soma do ledger e que uma wager processada financeira tem exatamente o lançamento correspondente; LOSS e transações não processadas não podem ter lançamentos. FKs compostas protegem contexto de Wallet/player e moeda do ledger. Referência processada é validada quanto a contexto, kind, valor e status. Essas proteções foram validadas nas suítes reais PostgreSQL aprovadas pelo responsável técnico e na revisão independente.
+The system operates safely across 3 or more concurrent processes:
 
-`recorded_balance_currency` foi acrescentado ao snapshot. Em rejeição CURRENCY_MISMATCH, money preserva a moeda enviada, enquanto o snapshot preserva a moeda real da Wallet. Por isso uma wager rejeitada pode carregar moeda diferente da Wallet; uma processada e seu ledger não podem. Não se falsifica a moeda do payload para tornar a rejeição persistível.
+- **Hot-Wallet Serialization:** Concurrent bets or reversals targeting the same `walletId` serialize on `SELECT ... FROM wallets WHERE id = ? FOR UPDATE`. In the mandatory challenge scenario (initial balance `100.00 BRL`, two simultaneous `80.00 BRL` bets), the first holder debits to `20.00 BRL` (`version = 2`, `PROCESSED`) and commits; the second holder acquires the lock, observes `20.00 BRL`, records a `REJECTED` wager (`INSUFFICIENT_FUNDS_BET`, `recordedBalance = 20.00 BRL`), and commits without altering wallet balance or ledger.
+- **Cross-Wallet Parallelism:** Operations on distinct `walletId`s lock disjoint rows in `wallets` and execute in parallel without contention.
+- **Cross-Wallet Key Collision Race:** If two concurrent requests reuse the same `idempotency_key` targeting two **different** wallets (`walletA` and `walletB`), both may lock their respective wallets simultaneously, and the second `INSERT INTO wager_transactions` fails with `SQLSTATE 23505` (`uq_wager_idempotency`). `ProcessWagerTransactionUseCase` catches `23505` on business unique constraints, allows the losing transaction to roll back completely (leaving the losing wallet untouched), re-reads the committed winner in a fresh read-only transaction, and raises `IdempotencyConflictError` (or returns replay if identical).
 
-### Locks e Inbox — ARC2-01
+---
 
-READ COMMITTED; ordem: Wallet FOR UPDATE → claim Inbox, quando houver → wager/referência. Uma operação por transação, sem lock global e sem adquirir uma segunda Wallet ao encontrar referência inválida.
+### 15. Reversals and Out-of-Order References
 
-Leituras prévias de identidade são sem locks de linha. Garantem que uma key previamente utilizada com outro walletId gere IdempotencyConflictError, mesmo quando esse destino não existe. Se a Wallet não for encontrada, há nova leitura de identidade antes de NotFoundError. Uma operação concorrente ainda não comprometida não é presumida como já existente; o erro reflete a identidade visível na leitura de decisão.
+[`evaluateWager`](src/modules/wagering/domain/wager-rules.ts) is a pure decision function that evaluates reference and balance rules under the wallet lock:
 
-Inbox usa INSERT ON CONFLICT DO NOTHING RETURNING depois do lock da Wallet e antes de escritas/bloqueios da wager. Em colisão, outra instrução READ COMMITTED lê o vencedor comprometido. Hash divergente é conflito; hash igual requer Inbox processada e wager com identidade/key/hash correspondentes. Inbox comprometida sem processedAt, ou sem wager correspondente, é inconsistência e não autoriza novo efeito.
+- **Reference Matching:** Resolved by `(providerId, referenceExternalTransactionId)`. Must match `playerId`, `walletId`, `roundId`, and `currency` (`REFERENCE_CONTEXT_MISMATCH` otherwise).
+- **Allowed Reference Kinds:**
+  - `WIN` (when `referenceExternalTransactionId` is provided) must reference a `BET`.
+  - `REFUND` must reference a `BET` (`REFERENCE_INVALID_KIND` otherwise).
+  - `ROLLBACK` must reference a `BET`, `WIN`, or `REFUND` (`REFERENCE_INVALID_KIND` otherwise).
+- **Exact Amount for Reversals:** `REFUND` and `ROLLBACK` must have `money.equals(reference.money)` (`REFERENCE_AMOUNT_MISMATCH` otherwise). `WIN` may have any positive amount.
+- **Single Reversal Invariant:** A referenced transaction can have at most **one** `PROCESSED` reversal (`REFUND` or `ROLLBACK`), enforced both in domain rules (`referenceAlreadyReversed`, including rejecting a late `WIN` referencing an already-reversed `BET`) and at the database level via partial unique index `uq_wager_processed_reversal`. Chained reversals (`BET -> REFUND -> ROLLBACK(ref=REFUND)`) are valid because the `ROLLBACK` references the `REFUND` transaction, not the already-reversed `BET`.
+- **Out-of-Order Arrival:** When `reference` does not yet exist in `wager_transactions` or is still non-terminal (`PENDING` / `PENDING_REFERENCE`), `evaluateWager` returns `{ status: 'PENDING_REFERENCE' }`. If `reference` is already terminal `REJECTED` or `FAILED`, `evaluateWager` immediately rejects the dependent wager with `REFERENCE_NOT_PROCESSED`.
 
-Replay por uma nova mensagem persiste a nova Inbox processada no mesmo commit, sem novo ledger/outbox financeiro. Em PENDING_REFERENCE, processedAt da Inbox significa conclusão daquela entrega, não conclusão financeira. Nenhum polling ou ACK SQS é implementado.
+---
 
-23505 é classificado pela constraint. Apenas uq_wager_idempotency e uq_wager_provider_external autorizam releitura do vencedor e comparação para replay. Rollback completo precede a releitura em contexto novo. Para persistir Inbox de uma nova entrega após a colisão, uma nova tentativa segue novamente Wallet → Inbox → wager. Outras violações não são convertidas em replay. 40P01, 40001, lock timeout e statement timeout têm no máximo três tentativas por padrão, fork novo e backoff limitado fora da transação.
+### 16. PendingReferenceWorker and Terminal Overflow Handling (`FIX-D02`)
 
-### Casos de uso e consultas
+[`PendingReferenceWorker`](src/modules/wagering/application/pending-reference-worker.ts) and [`pending-reference-policy.ts`](src/modules/wagering/application/pending-reference-policy.ts) manage the lifecycle of `PENDING_REFERENCE` transactions:
 
-CreateWalletUseCase persiste o bundle de abertura e os dois eventos atomicamente; zero não cria OPENING/ledger/eventos. ProcessWagerTransactionUseCase compartilha o contrato de negócio entre entradas futuras HTTP/SQS, calcula SHA-256 canônico, preserva snapshots e grava Inbox/Outbox no mesmo commit. Não executa publicação externa.
+- **Shared Policy (`pending-reference-policy.ts`):** Both initial acceptance in `ProcessWagerTransactionUseCase` and subsequent retries in `PendingReferenceWorker` share `PENDING_REF_BASE_DELAY_MS` (`1000` ms), `PENDING_REF_MAX_ATTEMPTS` (`10`), and `PENDING_REF_TTL_MS` (`86400000` ms / 24h).
+- **Lock-Free Discovery & Per-Candidate Isolation:** `findDuePendingWagers(now, limit)` queries `status = 'PENDING_REFERENCE' AND next_retry_at <= ?` ordered by `(next_retry_at ASC, created_at ASC, id ASC)` without holding row locks. Each candidate is processed in its own isolated UoW (`Wallet FOR UPDATE` -> ownership check -> `Wager FOR UPDATE` -> `now = runtime.now()` revalidation -> same-wallet `Reference FOR UPDATE`). A failure on one candidate never aborts or blocks subsequent candidates in the batch.
+- **TTL Semantics (Approved Option A):** `expiresAt` limits how long a wager waits for an **unavailable** reference. If the referenced transaction is already available and valid when `PendingReferenceWorker` evaluates the candidate, the wager is processed normally even if the worker scan was delayed past `expiresAt`. If the reference is still missing/pending and either `attempts + 1 >= maxAttempts`, `now >= expiresAt`, or the next backoff timestamp `nextRetryAt >= expiresAt`, the wager transitions to `REJECTED` with `FailureCode.ReferenceNotFoundTimeout` (`REFERENCE_NOT_FOUND_TIMEOUT`) and enqueues `WagerTransactionRejected`.
+- **Terminal Overflow Handling (`FIX-D02`):**
+  - If a `WIN`, `REFUND`, or `ROLLBACK` was accepted as `PENDING_REFERENCE` and, by the time its reference arrives, the wallet balance has grown near `9999999999999999.99` (`NUMERIC(18,2)` max), executing `wallet.credit(...)` throws [`MoneyOverflowError`](src/shared/domain/domain-errors.ts) before mutating `wallet`.
+  - Rather than letting `MoneyOverflowError` escape as an unhandled exception (which would leave `attempts` and `next_retry_at` unchanged in an infinite retry loop) or misclassifying it as `REFERENCE_NOT_FOUND_TIMEOUT`, `PendingReferenceWorker` catches `MoneyOverflowError` on the movement calculation and transitions the wager `PENDING_REFERENCE -> FAILED` with `FailureCode.InfrastructurePermanent` (`INFRASTRUCTURE_PERMANENT`) and `wallet.balance` as the recorded snapshot:
+    - Calls `wager.fail(FailureCode.InfrastructurePermanent, wallet.balance)` (which clears `nextRetryAt` and `expiresAt`).
+    - Persists `store.updatePendingWager(wager)` inside the same transaction under `Wallet -> Wager` locks (requiring `1` affected row or aborting with `PersistenceInvariantError`).
+    - Does **not** modify `wallets.balance`, `wallets.version`, or `wallet_ledger_entries`, and does **not** enqueue `Processed`, `Rejected`, or `BalanceChanged` Outbox events.
+    - Emits structured operational log (`event: "pending_reference_failed"`, `code: "MONEY_OVERFLOW"`, `failureCode: "INFRASTRUCTURE_PERMANENT"`) and `wager-status: "FAILED"` metric **after** database commit.
+    - Subsequent worker scans ignore the terminal row, and HTTP/SQS replays return the persisted `FAILED` snapshot (`422 Unprocessable Entity` on HTTP, `ACK` on SQS).
 
-GetWallet/GetWagerTransaction são consultas de estado. ListWalletLedger usa cursor base64url de (createdAt,id), ordenação descendente e timestamp PostgreSQL com seis casas no cursor, preservando precisão mesmo com timestamps iguais. ReconcileWallet usa REPEATABLE READ para wallet e agregado do ledger; retorna diferença e registra somente identificação da divergência, sem corrigir dados ou expor payload financeiro em logs.
+---
 
-### Validação e estimativa — ARC2-03
+### 17. SQS Consumer
 
-Testes executados externamente e aprovados para migrations up/down/up, SQL direto negativo, atomicidade com falha em cada fase, 50 replays concorrentes, apostas disputando saldo, Inbox concorrente, reversões cruzadas e três processos Bun com conexões próprias. O harness usa confirmação de readiness, IPC por stdio e barreira explícita para forçar colisão de key entre Wallets distintas. Um teste mantém uma Wallet bloqueada enquanto outra conclui. Outro injeta 40P01 no próprio PostgreSQL via trigger de teste e sequência não transacional, para verificar retry limitado e rollback; não é apresentado como deadlock físico observado.
+[`SqsWagerConsumer`](src/modules/messaging/application/sqs-wager-consumer.ts) (entrypoint [`scripts/consume-wagers.ts`](scripts/consume-wagers.ts)) processes messages from `wager-transactions.fifo`:
 
-Processos de teste também terminam antes do commit e depois do commit/antes da resposta para verificar rollback/replay persistente. Isso não comprova ACK SQS ou recuperação de publisher, exclusivos do IMP-03. Reconciliação é exigida após os cenários financeiros.
+- **Startup Verification:** Verifies that `wager-transactions.fifo` and `wager-transactions-dlq.fifo` exist, are FIFO queues with `ContentBasedDeduplication = "false"`, and that `wager-transactions.fifo` has a `RedrivePolicy` targeting the DLQ ARN with `maxReceiveCount === SQS_MAX_RECEIVE_COUNT` (`5`).
+- **Post-Commit ACK Guarantee:** `DeleteMessage` is invoked **only** after `ProcessWagerTransactionUseCase.execute` commits (`PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, or idempotent replay including historical `FAILED`). If `DeleteMessage` fails after commit, the consumer logs `ACK_FAILED` and returns `'ack-failed'`; the subsequent SQS redelivery hits the committed `InboxMessage` / `WagerTransaction` and ACKs cleanly as an idempotent replay.
+- **Error Classification (`REV3-FIX-01`):**
+  - **Permanent Contract/Identity Errors** (`InvalidJsonEnvelope`, `InvalidDomainInputError`, `InvalidMoneyError`, `MoneyOverflowError`, `CurrencyMismatchError`, `IdempotencyConflictError`): Forwarded manually to `wager-transactions-dlq.fifo` as a sanitized `WagerTransactionDeadLetter` JSON diagnostic (containing `messageId`, `sqsMessageId`, `payloadHash`, `errorCode`, `receiveCount`, and `failedAt`, omitting raw financial payloads and secrets). The source message is deleted **only after** `SendMessage` to the DLQ succeeds.
+  - **Transient & Unknown Errors** (`NotFoundError`, PostgreSQL `40P01`/`40001`/`55P03`/`57014`/`08*`/`57P*`/`53300`, network timeouts, and unclassified errors): Never trigger manual DLQ transfers or source deletion. The consumer adjusts visibility timeout via exponential backoff (`ChangeMessageVisibility`) and lets SQS native `RedrivePolicy` move the original `WagerTransactionRequested` envelope to the DLQ after `maxReceiveCount` receives.
 
-A estimativa histórica reservava 8–12 h, ou 10–16 h com contingência, para validação crítica. A execução real foi concluída externamente; bloqueios anteriores do sandbox não são bloqueios do pacote aprovado nem são contabilizados como testes locais aprovados.
+---
 
-### Rastreabilidade de revisões
+### 18. OutboxPublisher
 
-| Achado | Registro nesta implementação |
-|---|---|
-| VAL01-01 | Reagendamento explícito e testes de estado/attempts |
-| VAL01-02 | BET/LOSS sem referência; markProcessed rejeita referência inesperada |
-| VAL01-03 | Bootstrap HTTP do IMP-01 e NestJS + MikroORM do IMP-02 aprovados externamente; rastreabilidade REV2 detalhada abaixo |
-| ARC2-01 | Wallet → Inbox → wager, rollback e comparação de vencedor |
-| ARC2-02 | UUID interno, playerId e demais identificadores externos TEXT |
-| ARC2-03 | Harness multi-processo, atomicidade e reserva de execução |
-| REV2-01 | Pacote aceito após revisão independente; garantias demonstradas listadas abaixo. Texto original ausente: correspondência individual por ID não verificável neste checkout |
-| REV2-02 | Pacote aceito após revisão independente; garantias demonstradas listadas abaixo. Texto original ausente: correspondência individual por ID não verificável neste checkout |
-| REV2-03 | Pacote aceito após revisão independente; garantias demonstradas listadas abaixo. Texto original ausente: correspondência individual por ID não verificável neste checkout |
-| REV2-04 | Pacote aceito após revisão independente; garantias demonstradas listadas abaixo. Texto original ausente: correspondência individual por ID não verificável neste checkout |
+[`OutboxPublisher`](src/modules/messaging/application/outbox-publisher.ts) (entrypoint [`scripts/publish-outbox.ts`](scripts/publish-outbox.ts)) delivers committed integration events from `outbox_messages` to `wagering-events.fifo`:
 
-Atendimento efetivamente demonstrado no IMP-02: schema/constraints/triggers, atomicidade, idempotência persistente e snapshots, ordem Wallet → Inbox → wager/referência, reversões concorrentes, reconciliação, três processos independentes e recuperação antes/depois do commit. O aceite independente e humano do pacote foi comunicado por Luís. Sem os textos originais REV2, não se atribui arbitrariamente cada garantia a um ID; este é um limite documental de rastreabilidade, não um novo achado bloqueante da revisão recebida. Os documentos normativos permanecem intactos.
+1. **Lease Claim (`claimOutbox`):** In a short transaction, selects one due row (`published_at IS NULL AND next_attempt_at <= ? AND (claimed_until IS NULL OR claimed_until <= ?)`) ordered by `(next_attempt_at ASC, occurred_at ASC, id ASC)` using `FOR UPDATE SKIP LOCKED`, stamps `claim_owner`, a fresh UUID `claim_token`, and `claimed_until = now + leaseMs` (`10000` ms default), and commits.
+2. **Pre-Send Lease Margin Check:** Before calling SQS outside the SQL transaction, verifies that `claimed_until - now >= sendTimeoutMs + 1000` (`3000` ms + `1000` ms margin).
+3. **SQS Publication:** Publishes the immutable JSON payload to `wagering-events.fifo` with `MessageGroupId = aggregateId` (`walletId`) and `MessageDeduplicationId = eventId`, bounded by `AbortSignal.timeout(sendTimeoutMs)`.
+4. **Lease-Fenced Confirmation (`completeOutbox` / `failOutbox`):** Opens a second transaction executing `UPDATE outbox_messages SET published_at = ?, claim_owner = NULL, claim_token = NULL, claimed_until = NULL WHERE id = ? AND published_at IS NULL AND claim_owner = ? AND claim_token = ? AND claimed_until > ?`. If a slow publisher's lease expired and another publisher already claimed the row, the fenced `UPDATE` affects `0` rows (`false`) and prevents stale-owner corruption.
 
-### Encaminhamentos da revisão VAL02
+---
 
-| Achado | Encaminhamento |
-|---|---|
-| VAL02-01 | IMP-04: teste de divergência real em ReconcileWalletUseCase e tratamento de soma negativa; não implementado neste fechamento |
-| VAL02-02 | CP-04: política compartilhada implementada e validada externamente (20 testes/171 asserções); semântica do TTL formalmente aprovada por Luís (Opção A) |
-| VAL02-03 | Resolvido documentalmente neste fechamento: estado, validações externas e notas históricas do IMP-02 atualizados |
+### 19. Retry, Backoff, and Dead-Letter Queue (DLQ)
 
-O parecer não bloqueante e o aceite humano encerram o IMP-02; não autorizam início automático do IMP-03. Publicação deve ser confirmada pelo resultado efetivo dos comandos Git, sem presumir sucesso de rede ou permissão.
+| Subsystem | Retry Trigger | Backoff Strategy | Exhaustion Behavior |
+|---|---|---|---|
+| **PostgreSQL UoW** (`ProcessWager`, `CreateWallet`, `PendingRef`) | `40P01`, `40001`, `55P03`, `57014`, `23505` (business unique race) | `20ms * 2^attempt` outside transaction (`maxAttempts = 3`) | Throws `RetryExhaustedError` (`503` on HTTP; transient visibility retry on SQS) |
+| **SQS Consumer** (`SqsWagerConsumer`) | Transient DB/network error, missing wallet (`NotFoundError`), or unknown error | `ChangeMessageVisibility` backoff (`min(visibilityTimeout, 2^(receiveCount - 1))`) | Native SQS `RedrivePolicy` transfers original message to `wager-transactions-dlq.fifo` after `5` receives |
+| **SQS Consumer Permanent Errors** | Malformed JSON, invalid DTO/Money, `IdempotencyConflictError` | Immediate (`0` retries) | Sends sanitized `WagerTransactionDeadLetter` to DLQ, then `DeleteMessage` on input queue |
+| **Outbox Publisher** (`OutboxPublisher`) | SQS `SendMessage` error or timeout | `min(60000ms, 1000ms * 2^(attempts - 1))` via `failOutbox` | Retries indefinitely until published (events are never dropped) |
+| **Pending Reference** (`PendingReferenceWorker`) | Referenced transaction missing or still non-terminal | `1000ms * 2^attempts` (`maxAttempts = 10`, `TTL = 86400000ms`) | Transitions wager to `REJECTED` (`REFERENCE_NOT_FOUND_TIMEOUT`) and enqueues `WagerTransactionRejected` |
 
-## IMP-03 — histórico de validação dos CP-01 a CP-05
+---
 
-Base `013f151470b688b4f13469f73332ac4acf43f8fd`. Luís confirmou externamente SDK SQS 3.922.0, frozen install, typecheck, cinco testes PostgreSQL/31 asserções e `bun scripts/check-sqs.ts` exit 0: três filas FIFO e redrive para a DLQ com maxReceiveCount=5. **Gate CP-01 validado.** Docker/LocalStack continuam inacessíveis ao executor; as evidências externas são atribuídas ao responsável técnico. LocalStack preserva os serviços e o volume PostgreSQL. Não se usa FIFO como garantia financeira. Ver IMP-03-EVIDENCE.md para resultados e limites.
+### 20. Crash Recovery and Coordinated Shutdown
 
-ClockPort fornece instantes explícitos para vencimento e leases; os novos comandos SQL não usam now(). Produção requer UTC e relógios sincronizados/monitorados. Configuração valida timeout/lease com margem mínima de 1000ms e valores positivos; entrada e worker compartilham a política de referência desde o CP-04, validado externamente.
+- **Coordinated Worker Shutdown (`worker-shutdown.ts`, `worker-signals.ts`):**
+  - Standalone workers (`consume-wagers.ts`, `publish-outbox.ts`, `resolve-pending-references.ts`) register `SIGTERM`/`SIGINT` handlers via [`enableWorkerSignals`](src/shared/application/worker-signals.ts) (programmatic callers use `closeWorkerApplication`).
+  - On signal receipt, `WorkerShutdown` arms a hard watchdog timer (`WORKER_SHUTDOWN_TIMEOUT_MS`, default `60000` ms), aborts idle polling via `AbortSignal`, waits for the current in-flight operation to finish while the PostgreSQL connection pool is still open (allowing post-commit SQS ACK or Outbox confirmation to complete), then invokes `app.close(signal)` to close MikroORM and destroy SQS clients before disarming the watchdog.
+  - If an idle SQS long-poll returns a message after shutdown has started, the consumer immediately releases visibility (`ChangeMessageVisibility(0)`) without processing or ACKing it.
+  - If the shutdown deadline expires while an operation or resource disposal is stuck, the watchdog terminates the process with `process.exit(1)` so the supervisor can restart it cleanly.
+- **Crash Consistency at Every Failure Boundary (`SIGKILL` / Power Loss):**
+  - **Before SQL Commit:** PostgreSQL automatically rolls back uncommitted changes across all 5 tables.
+  - **After SQL Commit, Before HTTP Response or SQS ACK:** On retry/redelivery, `idempotency_key` and `inbox_messages` return the committed historical snapshot (`idempotentReplay: true`) and complete the SQS ACK without duplicating debits, credits, or Outbox events.
+  - **After Outbox Claim or After SQS `SendMessage`, Before `completeOutbox`:** When `claimed_until` expires (`10000` ms), another publisher claims and republishes the event (`at-least-once` delivery with stable `eventId` and SQS FIFO deduplication within the 5-minute deduplication window).
 
-Primitivas de WorkerStore compõem FinancialStore no mesmo UnitOfWork. Descoberta de pendências não bloqueia wagers; a resolução implementada no CP-04 exige Wallet → Wager, revalidando status e vencimento. Atualização altera somente campos mutáveis e exige origem PENDING_REFERENCE. Claim Outbox é individual, com CTE FOR UPDATE SKIP LOCKED e owner/token/until, devendo ser commitado antes de SQS. Confirmação e retry são condicionais a owner/token, evento pendente e lease ainda válido no instante fornecido; false indica claim perdido. Retry confere contador e aceita apenas código diagnóstico seguro. A reidratação Outbox admite política opcional sem mudar o default existente.
+---
 
-CP-02 implementa Consumer com adapter SDK SQS e porta de transporte; decoder seleciona campos do contrato original, normaliza referência ausente/null e usa Money/UUID existentes. envelope.messageId identifica Inbox; sqs.MessageId é diagnóstico de transporte; data.idempotencyKey mantém identidade financeira; ReceiptHandle é token efêmero de ACK/visibilidade. occurredAt de transporte é validado, mas não entra no hash. correlationId opcional usa messageId como fallback; causationId aponta para a mensagem de origem.
+### 21. Versioned Migrations, Constraints, and `NaN` Protection (`FIX-D01`)
 
-O Consumer chama o mesmo ProcessWagerTransactionUseCase, sem nova camada financeira, e só executa DeleteMessage após seu retorno confirmado por commit. PROCESSED, REJECTED, PENDING_REFERENCE e replay (inclusive FAILED histórico) fazem ACK. Falha de ACK após commit segue para redelivery/replay, nunca reclassifica a operação financeira como permanente. Classificação distingue conflitos, contratos/Money, NotFound, PostgreSQL transitório, rede, timeout e desconhecidos. Após REV3-FIX-01, transientes e desconhecidos usam backoff de visibilidade e redrive nativo: unknown nunca provoca envio manual de diagnóstico à DLQ nem DeleteMessage por esgotamento. A RedrivePolicy é o único controle de esgotamento desses recebimentos e preserva o envelope original. O startup confere que maxReceiveCount e ARN da DLQ correspondem à configuração efetiva.
+Schema management is governed strictly by versioned, transactional, reversible migrations registered in [`src/database/config.ts`](src/database/config.ts) (`transactional: true, allOrNothing: true, snapshot: false`):
 
-Envio manual à DLQ fica restrito aos erros comprovadamente permanentes e exige confirmação SendMessage antes de apagar origem. GroupId válido e dedupId SHA-256 são determinísticos por identidade SQS/hash do corpo. O diagnóstico manual inclui somente tipo/versão, identidade SQS, hash, código estável, contador e instante; omite corpo financeiro, receipt, exceção bruta e credenciais. Isso impede reconstruir o payload original apenas pela mensagem de diagnóstico manual; a investigação desses erros permanentes depende das identidades/hash e do produtor. O redrive nativo mantém o corpo original por semântica SQS, inclusive para falhas de infraestrutura sem code reconhecido. DLQ_SEND_FAILED e ACK_FAILED mantêm origem para retry; dedup FIFO tem janela limitada, sem promessa de entrega única. A DLQ pode conter diagnóstico manual ou envelope original; não reenviar um diagnóstico como instrução financeira. Nenhum desses corpos é copiado para logs.
+1. **[`Migration202611040001.ts`](src/database/migrations/Migration202611040001.ts) (Baseline Financial Schema — SHA-256 `597fb090...`):**
+   - Creates `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages`, and `outbox_messages`.
+   - Enforces unique constraints (`uq_wallets_player_currency`, `uq_wager_idempotency`, `uq_wager_provider_external`, `uq_ledger_transaction`, `uq_wager_processed_reversal` partial unique index, `pk_inbox_messages`).
+   - Enforces non-negativity and state invariants (`ck_wallet_balance_non_negative`, `ck_wallet_version_positive`, `ck_wager_amount_positive`, `ck_wager_recorded_balance_non_negative`, `ck_wager_status_fields`, `ck_ledger_amount_positive`, `ck_ledger_balances_non_negative`, `ck_ledger_balance_math`, `ck_outbox_claim_all_or_none`).
+   - Installs immediate triggers blocking `UPDATE`/`DELETE` on `wallet_ledger_entries`, blocking mutations/deletions of terminal `wager_transactions`, and validating reference context/kind/amount on processed wagers.
+   - Installs `DEFERRABLE INITIALLY DEFERRED` constraint triggers (`trg_wallet_balance_matches_ledger`, `trg_wager_ledger_consistency`, `trg_ledger_requires_processed_wager`) verifying at `COMMIT` that every wallet's materialized `balance` equals the exact sum of its ledger entries and every `PROCESSED` balance-affecting wager has a matching ledger entry.
+2. **[`Migration202611060001.ts`](src/database/migrations/Migration202611060001.ts) (`FIX-D01` Monetary Finiteness Hardening — SHA-256 `bcb5d7f0...`):**
+   - **Root Cause Addressed:** PostgreSQL `NUMERIC(18,2)` natively rejects `Infinity`/`-Infinity` via typmod (`SQLSTATE 22003`), but permits `'NaN'::numeric`. Because `'NaN'::numeric >= 0` and `'NaN'::numeric = 'NaN'::numeric` evaluate to `TRUE` in PostgreSQL, a direct SQL write containing `'NaN'::numeric` across wallet, wager, and ledger could previously satisfy arithmetic checks and deferred triggers.
+   - **Solution:** Adds three immediate `CHECK` constraints (without `NOT VALID`) covering all six monetary `NUMERIC(18,2)` columns:
+     - `wallets`: `ck_wallet_all_finite CHECK (balance NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric))`
+     - `wager_transactions`: `ck_wager_all_finite CHECK (amount NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) AND recorded_balance_amount NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric))` (`NULL` on `recorded_balance_amount` continues to pass because `NULL NOT IN (...)` evaluates to `UNKNOWN`, which satisfies SQL `CHECK` constraints).
+     - `wallet_ledger_entries`: `ck_ledger_all_finite CHECK (amount NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) AND balance_before NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) AND balance_after NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric))`
+   - **Legacy Data Integrity & Atomicity:** Because the constraints are added without `NOT VALID` inside a transactional migration, PostgreSQL immediately validates all existing rows. Any legacy `NaN` in any of the three tables aborts the entire `UP` migration with `SQLSTATE 23514` (`check_violation`) without modifying historical data or leaving partial constraints.
+   - **Surgical `DOWN`:** `Migration202611060001.down()` drops **only** `ck_ledger_all_finite`, `ck_wager_all_finite`, and `ck_wallet_all_finite`, preserving all tables, records, triggers, and baseline constraints from `Migration202611040001`.
 
-A entrada operacional é `bun scripts/consume-wagers.ts`, contexto Nest standalone de MessagingModule.forConsumer com DatabaseModule; importar MessagingModule base no HTTP não inicia loops. Cada instância recebe uma mensagem por vez, com long polling cancelável e timeout independente para operações in-flight. beforeApplicationShutdown drena o loop antes do fechamento MikroORM em onApplicationShutdown; encerramento com limite configurado, SIGTERM real e preservação do pool compõem o CP-05, validado funcionalmente na regressão externa final de Luís. Startup falho encerra o processo com código 1 para não manter recursos de um contexto parcial.
+---
 
-CP-02 validado externamente por Luís: `bun test test/integration/sqs-consumer.test.ts`, 14 testes aprovados, zero falhas, 87 asserções em PostgreSQL 16.6/LocalStack 4.10.0 reais. CP-03 validado externamente por Luís: 10 testes aprovados, zero falhas, 412 asserções; PostgreSQL 16.6/LocalStack 4.10.0, três processos/backends distintos, 100 eventos sem perda nos cenários. CP-04 validado por Luís: 20 testes aprovados, 0 falhas, 171 asserções, três processos/backends PostgreSQL independentes. CP-05 validado funcionalmente na regressão externa final executada por Luís no Ubuntu com PostgreSQL 16.6 e LocalStack 4.10.0 reais: **345 testes aprovados, 0 falhas, 2500 asserções, 29 arquivos**, typecheck, bootstrap NestJS + MikroORM e git diff --check aprovados. A execução é atribuída ao responsável técnico, não ao Codex nesta sessão. IMP-03 aguarda revisão independente do Antigravity e aprovação humana; IMP-04 não iniciado. Modelo: at-least-once delivery com efeitos financeiros idempotentes persistentes.
+### 22. Health Checks and Observability
 
-### CP-03 — Outbox Publisher
+- **Health Endpoints (`HealthController` & `HealthReadiness`):**
+  - `GET /health/live`: Returns `200 OK` `{ "status": "ok" }`.
+  - `GET /health/ready`: Coalesces concurrent readiness checks into a single bounded flight (`HEALTH_READINESS_TIMEOUT_MS`, default `1500` ms) executing `PostgresHealthProbe` (`SELECT 1`) and the `HealthReadiness` SQS probe (verifying `wager-transactions.fifo`, `wager-transactions-dlq.fifo`, `wagering-events.fifo`, FIFO attributes, and `RedrivePolicy`). Returns `200 OK` when both dependencies are `"up"`, or `503 Service Unavailable` (`"not_ready"` or `"draining"` once shutdown starts).
+- **Operational Metrics (`MetricsController` & `DefaultOperationalMetricsCollector`):**
+  - `DatabaseModule` provides a single `OPERATIONAL_METRICS` collector instance shared across the financial use cases and workers within that DI graph.
+  - `GET /metrics` returns a deep-frozen `OperationalMetricsSnapshot` (`scope: "process"`). Counters saturate at `Number.MAX_SAFE_INTEGER`, label sets have fixed cardinality, and `operationalMetricsEmitter` isolates observer exceptions, rejected promises, and reentrancy so observability faults can never alter financial outcomes.
+- **Structured Logging (`operational-logging.ts`):**
+  - Emits sanitized single-line JSON logs to `stderr` (`stderrOperationalLog`), propagating `x-correlation-id` and redacting sensitive keys and credentials.
+
+---
+
+### 23. Authentication and IdP Extension Point
+
+Following Section 2 of [`technical-challenge.md`](technical-challenge.md), external authentication was intentionally left unimplemented to dedicate the development window to financial correctness, concurrency, idempotency, and distributed recovery:
+
+- **Explicit Extension Point in Code:** [`ProviderIdentityGuard`](src/shared/infrastructure/provider-identity.guard.ts) implements NestJS `CanActivate` and is attached via `@UseGuards(ProviderIdentityGuard)` on [`WalletsController`](src/modules/wallets/infrastructure/wallets.controller.ts) and [`WageringController`](src/modules/wagering/infrastructure/wagering.controller.ts), while [`HealthController`](src/shared/infrastructure/health.controller.ts) remains open.
+- **Target Production IdP Design (Keycloak / Zitadel via OIDC):**
+  1. Deploy an external OIDC-compliant Identity Provider (Keycloak or Zitadel) issuing short-lived asymmetric JWT access tokens (`RS256` / `ES256`) to game providers via OAuth 2.0 `client_credentials`.
+  2. In `ProviderIdentityGuard`, validate the `Authorization: Bearer <token>` header against the IdP's cached JWKS endpoint, checking cryptographic signature, `iss` (issuer), `aud` (audience), `exp`/`nbf` timestamps, and required scopes.
+  3. Extract the authenticated provider identity claim (`provider_id`) from the verified token and bind it to the request context, rejecting any `POST /wagering/transactions` or `GET /providers/:providerId/...` request where the payload/path `providerId` does not match the authenticated principal (`403 Forbidden`).
+  4. Keep SQS on an internal private VPC/IAM boundary where messages remain subject to full domain validation.
 
-OutboxPublisher usa FinancialUnitOfWork e os métodos CP-01 sem alterar SQL/schema financeiro. Cada tentativa gera token UUID novo, reivindica um evento com SKIP LOCKED/lease e aguarda commit. SQS é chamado fora da transação de claim. Em seguida outra transação confirma published_at somente com id/owner/token, published_at nulo e lease ainda válido; false significa perda do claim. Falha de envio aplica OutboxMessage.scheduleRetry com política configurada e failOutbox com o mesmo fencing. Falha SQL após envio confirmado deixa confirmação pendente, sem confundir com falha SQS; após expiração, outro publisher assume. Nenhum evento é descartado por esgotamento de tentativas.
+---
 
-Adapter publica o envelope persistido sem reconstruir eventos: eventId estável, MessageGroupId=aggregateId e MessageDeduplicationId=eventId. Confere identidade do envelope antes de enviar. Mensagem/contrato monetário e timestamps permanecem intactos. FIFO só reduz duplicatas dentro da janela; recuperação pode reenviar e consumidores do evento precisam deduplicar por eventId.
+### 24. Guarantee Responsibility Matrix and Trade-offs
+
+| Financial / Distributed Property | Domain Layer (TypeScript) | PostgreSQL 16.6 (Schema / Locks / Triggers) | SQS / Worker Protocol |
+|---|---|---|---|
+| **Exact decimal scale & no `NaN`/`±Infinity`** | `Money.from` regex & `decimal.js` (`precision: 40`), `ExactNumericType` | `NUMERIC(18,2)` typmod + `ck_wallet_all_finite`, `ck_wager_all_finite`, `ck_ledger_all_finite` (`FIX-D01`) | JSON string serialization (`MoneyProps`) |
+| **Non-negative wallet balance** | `Wallet.debit` balance check | `ck_wallet_balance_non_negative` (`balance >= 0`) | N/A |
+| **Serialized per-wallet updates (no lost updates)** | Immutable `Money` + version increment | `SELECT ... FROM wallets WHERE id = ? FOR UPDATE` | FIFO `MessageGroupId = walletId` (optimization only) |
+| **1-to-1 movement and immutable ledger** | `Wallet.debit`/`credit` returns `WalletLedgerEntry` | `uq_ledger_transaction`, append-only trigger, deferred `trg_wallet_balance_matches_ledger` & `trg_wager_ledger_consistency` | N/A |
+| **Persistent idempotency & conflict detection** | `WagerTransaction.assertReplay`, `wagerPayloadHash` | `uq_wager_idempotency`, `uq_wager_provider_external`, `pk_inbox_messages` | Post-commit `DeleteMessage` (ACK) |
+| **Single reversal per reference** | `evaluateWager` (`referenceAlreadyReversed`) | Partial unique index `uq_wager_processed_reversal` | `PendingReferenceWorker` under `Wallet -> Wager` lock |
+| **Convergence on `PENDING_REFERENCE` overflow** | `MoneyOverflowError` before `Wallet` mutation | Atomic `updatePendingWager` (`FAILED` / `INFRASTRUCTURE_PERMANENT`) under `Wallet -> Wager` lock (`FIX-D02`) | Terminal replay (`422` on HTTP, `ACK` on SQS) |
+| **No event published before commit / no lost events** | `OutboxMessage.enqueue` | Atomic commit of `outbox_messages` + `FOR UPDATE SKIP LOCKED` lease fencing | At-least-once publish to `wagering-events.fifo` |
+
+#### Key Trade-offs
+
+1. **Pessimistic `FOR UPDATE` Locking vs Optimistic Locking:** Pessimistic locking on `wallets` serializes hot-wallet bursts inside PostgreSQL without burning CPU and database round-trips on optimistic version-conflict aborts, while keeping unrelated wallets completely lock-free.
+2. **Explicit Parameterized SQL in `PostgresFinancialStore` vs ORM Auto-Flush:** Writing explicit SQL inside `EntityManager.transactional()` guarantees exact lock acquisition order (`Wallet -> Inbox -> Wager`) and deterministic constraint error handling without sacrificing MikroORM migration and transaction management.
+3. **At-Least-Once Outbox with Lease Fencing vs Distributed 2PC:** Lease-fenced `SKIP LOCKED` claims avoid blocking financial commits on broker availability and recover automatically when a publisher crashes mid-send, at the standard cost of requiring downstream consumers to deduplicate by `eventId`.
+
+---
+
+### 25. Known Limitations and Historical Package Traceability
+
+#### Known Limitations
+
+- **Unauthenticated Local API:** `ProviderIdentityGuard` is a no-op extension point as permitted by the challenge; OIDC integration is required for untrusted network exposure.
+- **Process-Scoped Metrics:** `GET /metrics` exposes the in-memory collector of the HTTP process (`scope: "process"`) without cross-process aggregation.
+- **DLQ Envelope Coexistence:** `wager-transactions-dlq.fifo` can hold both `WagerTransactionDeadLetter` (manual sanitized diagnostic for permanent errors) and `WagerTransactionRequested` (native SQS redrive after transient exhaustion). Operational tooling must inspect `type` before replaying.
+- **Migration Validation Lock Cost:** `Migration202611060001` validates existing rows immediately (without `NOT VALID`); on large pre-existing tables, `ALTER TABLE ... ADD CONSTRAINT` acquires table locks and scans existing rows.
+- **TypeScript `skipLibCheck`:** Enabled per Bun's recommendation to bypass internal declaration conflicts between `@types/bun` and `@types/node` while keeping `strict: true` across all project code.
+
+#### Historical Package Traceability
+
+| Package / Milestone | Summary of Delivered Scope | Evidence Document |
+|---|---|---|
+| **IMP-01** | Foundation, NestJS bootstrap, pure `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage`, `IntegrationEvent`, and 93 domain unit tests | [`IMP-01-EVIDENCE.md`](IMP-01-EVIDENCE.md) |
+| **IMP-02** | PostgreSQL 16.6 + MikroORM 6.6.8 persistence, `Migration202611040001`, `PostgresUnitOfWork`, `Wallet -> Inbox -> Wager` locking, financial use cases, reconciliation, and 3-process concurrency tests | [`IMP-02-EVIDENCE.md`](IMP-02-EVIDENCE.md) |
+| **IMP-03 (`CP-01..05` & `REV3-FIX-01`)** | LocalStack SQS adapters, `SqsWagerConsumer`, `OutboxPublisher` with lease fencing, `PendingReferenceWorker` (TTL Option A), coordinated `SIGTERM` shutdown, and subprocess entrypoint tests | [`IMP-03-EVIDENCE.md`](IMP-03-EVIDENCE.md) |
+| **IMP-04 (`CP-01..05B` & `FINAL-DELIVERY-01`)** | HTTP controllers (`WalletsController`, `WageringController`, `HealthController`, `MetricsController`), `HttpExceptionFilter`, sanitized structured logging, operational metrics (`G6A` + `G6B`), and `1,205` passing tests | [`FINAL-DELIVERY-EVIDENCE.md`](FINAL-DELIVERY-EVIDENCE.md) |
+| **FIX-D01 & FIX-D02 (`FIX-D01-D02-FINAL`)** | `Migration202611060001` rejecting `NaN`/`±Infinity` across all 6 monetary columns, `PendingReferenceWorker` terminalizing `MoneyOverflowError` as `FAILED` (`INFRASTRUCTURE_PERMANENT`), `REV-D02-01/02` crash/multiprocess tests, and `1,243` passing tests | [`FIX-D01-EVIDENCE.md`](FIX-D01-EVIDENCE.md), [`FIX-D01-D02-FINAL-EVIDENCE.md`](FIX-D01-D02-FINAL-EVIDENCE.md) |
+
+---
+
+<a id="português"></a>
+
+## Português
+
+### Referências Normativas e Estado da Entrega
+
+- **Especificação Normativa do Desafio:** [`technical-challenge.md`](technical-challenge.md)
+- **Arquitetura Base Revisada:** [`Jungle-Architecture-v0.2.md`](Jungle-Architecture-v0.2.md)
+- **Evidência Consolidada da Entrega (`FIX-D01` + `FIX-D02`):** [`FIX-D01-D02-FINAL-EVIDENCE.md`](FIX-D01-D02-FINAL-EVIDENCE.md)
+- **Evidência de Finitude Monetária no PostgreSQL (`FIX-D01`):** [`FIX-D01-EVIDENCE.md`](FIX-D01-EVIDENCE.md)
+- **Evidência de Entrega do IMP-04:** [`FINAL-DELIVERY-EVIDENCE.md`](FINAL-DELIVERY-EVIDENCE.md)
+- **Evidências Históricas por Pacote:** [`IMP-01-EVIDENCE.md`](IMP-01-EVIDENCE.md), [`IMP-02-EVIDENCE.md`](IMP-02-EVIDENCE.md), [`IMP-03-EVIDENCE.md`](IMP-03-EVIDENCE.md)
+
+**Baseline Atual Verificada:** Todos os pacotes de implementação (`IMP-01` a `IMP-04`) e os pacotes de endurecimento pós-auditoria (`FIX-D01` e `FIX-D02`) estão concluídos e verificados com **1.243 testes aprovados** (`991` unitários em `27` arquivos + `252` de integração em `15` arquivos), **0 falhas** e **8.253 asserções**, além de `bun run typecheck` (`tsc --noEmit`).
+
+---
+
+### Sumário
+
+1. [Visão Geral da Arquitetura](#1-visão-geral-da-arquitetura)
+2. [Organização das Camadas](#2-organização-das-camadas)
+3. [Modelagem do Domínio](#3-modelagem-do-domínio)
+4. [Money e Precisão Decimal](#4-money-e-precisão-decimal)
+5. [Agregado Wallet](#5-agregado-wallet)
+6. [Agregado WagerTransaction](#6-agregado-wagertransaction)
+7. [Ledger Imutável (`WalletLedgerEntry`)](#7-ledger-imutável-walletledgerentry)
+8. [Transactional Inbox (`InboxMessage`)](#8-transactional-inbox-inboxmessage)
+9. [Transactional Outbox (`OutboxMessage` e `IntegrationEvent`)](#9-transactional-outbox-outboxmessage-e-integrationevent)
+10. [Unit of Work (`FinancialUnitOfWork` e `PostgresUnitOfWork`)](#10-unit-of-work-financialunitofwork-e-postgresunitofwork)
+11. [Transações PostgreSQL e Isolamento](#11-transações-postgresql-e-isolamento)
+12. [Locks Pessimistas e Ordem de Aquisição](#12-locks-pessimistas-e-ordem-de-aquisição)
+13. [Idempotência Persistente e Hash Canônico](#13-idempotência-persistente-e-hash-canônico)
+14. [Concorrência Distribuída](#14-concorrência-distribuída)
+15. [Reversões e Referências Fora de Ordem](#15-reversões-e-referências-fora-de-ordem)
+16. [PendingReferenceWorker e Tratamento Terminal de Overflow (`FIX-D02`)](#16-pendingreferenceworker-e-tratamento-terminal-de-overflow-fix-d02)
+17. [SQS Consumer](#17-sqs-consumer-1)
+18. [OutboxPublisher](#18-outboxpublisher-1)
+19. [Retry, Backoff e Dead-Letter Queue (DLQ)](#19-retry-backoff-e-dead-letter-queue-dlq)
+20. [Recuperação após Falhas e Shutdown Coordenado](#20-recuperação-após-falhas-e-shutdown-coordenado)
+21. [Migrations Versionadas, Constraints e Proteção contra `NaN` (`FIX-D01`)](#21-migrations-versionadas-constraints-e-proteção-contra-nan-fix-d01)
+22. [Health Checks e Observabilidade](#22-health-checks-e-observabilidade)
+23. [Autenticação e Ponto de Extensão IdP](#23-autenticação-e-ponto-de-extensão-idp)
+24. [Matriz de Responsabilidade das Garantias e Trade-offs](#24-matriz-de-responsabilidade-das-garantias-e-trade-offs)
+25. [Limitações Conhecidas e Rastreabilidade Histórica dos Pacotes](#25-limitações-conhecidas-e-rastreabilidade-histórica-dos-pacotes)
 
-Configuração inicial: OUTBOX_LEASE_MS=10000, SQS_SEND_TIMEOUT_MS=3000, OUTBOX_BASE_RETRY_MS=1000 e OUTBOX_MAX_RETRY_MS=60000. Validação exige pelo menos 1000ms entre timeout e lease; após commit do claim, o envio também exige essa margem ainda disponível. Timeout de envio é imposto por timer/AbortSignal, mesmo se o port não responder. Não há heartbeat. ClockPort fornece os instantes; produção deve sincronizar UTC e monitorar skew. Falhas SQL podem deixar o lease expirar; nunca se usa estado em memória como ownership definitivo.
+---
 
-Entrada standalone `bun scripts/publish-outbox.ts`, MessagingModule.forPublisher; importar módulo base não inicia workers. SQS_EVENTS_QUEUE_NAME default wagering-events.fifo, OUTBOX_WORKER_ID default único por processo/início, OUTBOX_POLL_INTERVAL_MS default 250. Lifecycle drena publishNext antes do fechamento ORM; CP-05 implementa o deadline e a coordenação de recursos, com validação funcional real de SIGTERM/pool incluída na regressão externa final de Luís.
+### 1. Visão Geral da Arquitetura
 
-Suíte preparada com filas/schema isolados inclui 100 eventos e três processos Bun/backend PIDs distintos, encerramento abrupto após claim e após SendMessage confirmado, timeout de confirmação após aceite real SQS, fencing de owners antigos, backoff configurado e invisibilidade de Outbox financeira não commitada. Esses cenários falharam no setup do sandbox por ECONNREFUSED e depois foram aprovados externamente por Luís, conforme os 10 testes/412 asserções acima. A evidência externa não é atribuída ao Codex. A falha de confirmação/timeouts é injetada no harness após envio real, sem afirmar que uma partição TCP real foi observada. O gate CP-03 foi encerrado pela evidência externa registrada.
+O Distributed Wagering Processor adota uma arquitetura modular orientada a Domain-Driven Design (DDD) e Ports-and-Adapters construída sobre **Bun 1.4.4**, **TypeScript 5.9.3 (strict)**, **NestJS 11.1.6**, **MikroORM 6.6.8**, **PostgreSQL 16.6** e **AWS SQS (LocalStack 4.10.0)**.
 
-### CP-04 — PendingReferenceWorker e política compartilhada
+Tanto as requisições HTTP síncronas (`POST /wagering/transactions`) quanto as mensagens SQS assíncronas (`wager-transactions.fifo`) convergem para o mesmo caso de uso de aplicação: [`ProcessWagerTransactionUseCase`](src/modules/wagering/application/process-wager-transaction.use-case.ts). O PostgreSQL atua como autoridade central para concorrência, idempotência, não-negatividade de saldo, imutabilidade do ledger e persistência atômica de Inbox/Outbox. A ordenação de filas SQS FIFO (`MessageGroupId`) é tratada exclusivamente como otimização de vazão, nunca como substituto para locks ou constraints do banco de dados.
 
-pending-reference-policy.ts é a fonte única de PENDING_REF_BASE_DELAY_MS=1000, PENDING_REF_MAX_ATTEMPTS=10 e PENDING_REF_TTL_MS=86400000. ProcessWagerTransactionUseCase passa a usá-la no agendamento inicial, preservando defaults, hash, identidade, regras financeiras e compatibilidade do construtor (override opcional interno). WorkerConfig delega a essa mesma fonte. TTL persistido em expiresAt é preservado ao reagendar; não se estende o prazo em reinícios.
+```mermaid
+flowchart LR
+  subgraph Ingress["Canais de Entrada"]
+    HTTP["API HTTP\n(WalletsController / WageringController)"]
+    SQSIn["Entrada SQS FIFO\n(wager-transactions.fifo)"]
+    DLQ["DLQ SQS FIFO\n(wager-transactions-dlq.fifo)"]
+  end
 
-O worker usa descoberta sem lock pelos métodos CP-01/ClockPort; por candidato abre transação nova, bloqueia Wallet primeiro, confere a associação do candidato por leitura sem lock e só então bloqueia Wager. Status e vencimento são revalidados com relógio lido após os locks. Referência da mesma Wallet é bloqueada depois; outra Wallet/referência inválida de outro contexto permanece somente leitura. Não há lock global ou garantia concorrencial em memória.
+  subgraph App["Núcleo de Aplicação e Workers Standalone"]
+    Consumer["SqsWagerConsumer\n(consume-wagers.ts)"]
+    UseCase["ProcessWagerTransactionUseCase\n& CreateWalletUseCase"]
+    PendingWorker["PendingReferenceWorker\n(resolve-pending-references.ts)"]
+    Publisher["OutboxPublisher\n(publish-outbox.ts)"]
+  end
 
-A decisão financeira vem de evaluateWager, Wallet e WagerTransaction existentes. Referência já válida é aplicada; referência terminal inválida recebe o código de domínio original. Quando a referência continua ausente/pendente, TTL/tentativas/backoff determinam a espera. O TTL limita a espera por referência indisponível: uma referência disponível/financeiramente válida continua avaliada pelas regras originais mesmo se o scan do worker atrasou. Contador attempts representa reagendamentos concluídos; a checagem de número attempts+1 é a tentativa atual. No default, até dez verificações de referência indisponível são permitidas, sem agendar uma décima primeira.
+  subgraph PG["PostgreSQL 16.6 (Transação Atômica Única)"]
+    Tables["wallets\nwager_transactions\nwallet_ledger_entries\ninbox_messages\noutbox_messages"]
+  end
 
-Agendamento inicial usa base; após o primeiro vencimento, próximo delay é base*2, depois base*4 etc. Antes de construir a próxima Date ou chamar reschedulePendingReference, verifica-se limite, expiração e next < expiresAt; se não houver próximo instante permitido, rejeita REFERENCE_NOT_FOUND_TIMEOUT. Não há clamp de data nem loop de erro por reagendamento igual/posterior ao prazo. Snapshot de aceite fica inalterado em reagendamentos; o terminal registra saldo observado na resolução.
+  subgraph Egress["Canal de Saída"]
+    SQSOut["Eventos SQS FIFO\n(wagering-events.fifo)"]
+  end
 
-Atualização é condicional à origem PENDING_REFERENCE, somente campos mutáveis, e precisa afetar uma linha. Zero inesperado aborta a transação. Movimento, versão, wager, ledger e eventos Outbox são atômicos; terminalização emite Processed/Rejected e BalanceChanged quando há movimento. Reagendamento mantém status/snapshot e não repete evento PendingReference; Inbox já processada no aceite não é alterada. Falhas SQL transitórias usam retry da transação inteira em contexto limpo, sem consumir tentativas da referência.
+  HTTP --> UseCase
+  SQSIn --> Consumer
+  Consumer -->|Erro Permanente + ACK| DLQ
+  Consumer -->|Redrive Nativo| DLQ
+  Consumer --> UseCase
+  UseCase -->|PostgresUnitOfWork| Tables
+  PendingWorker -->|Lock Wallet -> Wager| Tables
+  Tables -->|FOR UPDATE SKIP LOCKED| Publisher
+  Publisher -->|Evento At-Least-Once| SQSOut
+```
 
-Os eventos mantêm o contrato v1; na resolução, correlationId e causationId usam transactionId estável, pois a correlação original não integra o estado persistido Wager. Eventos anteriores conservam sua correlação original. As identidades permitem relacionar aceite e resolução, sem inventar metadados originais ou alterar schema.
+---
 
-Entrada explícita `bun scripts/resolve-pending-references.ts`, WageringModule.forPendingReferences, sem SDK/SQS operacional nesse processo. PENDING_REF_POLL_INTERVAL_MS=250 e PENDING_REF_BATCH_SIZE=100 são configuráveis; polling/drenagem/deadline têm implementação CP-05. Os 20 testes CP-04 foram aprovados externamente, incluindo três processos/backend PIDs, cadeias, reversões e atomicidade. A prova real dos novos hooks/sinais/pool integra a regressão final CP-05 aprovada funcionalmente por Luís.
+### 2. Organização das Camadas
 
-### CP-05 — shutdown coordenado, sinais e recuperação
+O código está estruturado em três camadas concêntricas estritas distribuídas entre módulos delimitados (`shared`, `wallets`, `wagering`, `messaging` e `database`):
 
-As implementações instaladas foram inspecionadas: MikroOrmCoreModule 6.1.1 fecha ORM em onApplicationShutdown; Nest 11.1.6 aguarda beforeApplicationShutdown antes dessa fase, mas callbacks de módulo raiz podem ocorrer antes dos importados no fechamento final. Por isso o watchdog não é desarmado num hook local presumindo que o pool já fechou.
+1. **Camada de Domínio (`src/**/domain/*`):**
+   - Contém agregados de negócio puros, objetos de valor, eventos de domínio e funções puras de decisão (`Money`, `Wallet`, `WalletLedgerEntry`, `WagerTransaction`, `evaluateWager`, `InboxMessage`, `OutboxMessage`, `IntegrationEvent`).
+   - Isenta de decorators de framework, metadados de ORM, consultas SQL ou importações do AWS SDK.
+2. **Camada de Aplicação (`src/**/application/*`):**
+   - Define casos de uso transacionais (`CreateWalletUseCase`, `ProcessWagerTransactionUseCase`, `GetWalletUseCase`, `ListWalletLedgerUseCase`, `ReconcileWalletUseCase`, `GetWagerTransactionUseCase`) e coordenadores de workers (`SqsWagerConsumer`, `OutboxPublisher`, `PendingReferenceWorker`).
+   - Depende apenas de objetos de domínio e portas de aplicação (`FinancialUnitOfWork`, `FinancialStore`, `ClockPort`, `OperationalMetricsPort`, `OperationalLogPort`).
+3. **Camada de Infraestrutura (`src/database/*`, `src/**/infrastructure/*`, `scripts/*`):**
+   - Implementa persistência (`PostgresUnitOfWork`, definições `EntitySchema` do MikroORM, `ExactNumericType`, migrations versionadas), transporte SQS (`AwsSqsConsumerTransport`, `AwsSqsOutboxTransport`, `localSqsClient`), sondas de health (`PostgresHealthProbe`, `HealthReadiness`), controllers HTTP, filtros de exceção e entrypoints CLI de workers standalone.
 
-WorkerShutdown interrompe novos polls por AbortSignal, aguarda o loop completo e mantém deadline WORKER_SHUTDOWN_TIMEOUT_MS (default 60000, faixa 1..300000ms) até os recursos terminarem. enableWorkerSignals coordena SIGTERM/SIGINT nos três scripts standalone: drain → app.close(signal) (hooks Nest, ORM e SQS) → completeShutdown. Não usar simultaneamente app.enableShutdownHooks nesses processos. Para fechamento programático dos módulos de worker, usar closeWorkerApplication; ele garante a mesma sequência e desarma o watchdog após todos os hooks.
+---
 
-Consumer cancela long polling ocioso; mensagem retornada após parada e ainda não processada tem visibility=0, sem ACK. Uma tentativa já em andamento termina com seu próprio prazo/transação; commit confirmado autoriza ACK enquanto o pool continua aberto. Falha concluída durante parada devolve visibilidade imediatamente. Recibo não conhecido por resposta de receive interrompida só pode ser recuperado pelo visibility timeout SQS. Publisher termina o evento em curso ou preserva lease/retry; PendingWorker termina o candidato em curso e não inicia o próximo.
+### 3. Modelagem do Domínio
 
-Se o deadline expira, o processo termina com exit 1, incluindo durante a limpeza de recursos. Não se encerra graciosamente o pool sob operação ainda ativa, não se fabrica ACK e não se registra stopped. O estado persistente/SQS oferece recuperação. Falha inesperada do loop também pede exit 1 para reinício pelo supervisor. stopped só é emitido depois de app.close completo; SIGKILL não executa hooks e depende de rollback PostgreSQL, Inbox/idempotência, visibilidade e leases. O supervisor deve dar margem além do timeout configurado antes de SIGKILL.
+Todas as classes de domínio impõem encapsulamento de estado e segurança nas transições:
 
-Testes CP-05 usam contexto Nest real, MikroORM/SQL reais, filas isoladas LocalStack e child processes; observadores verificam consulta SQL antes de ACK, flags in-flight, pool desconectado após close e PIDs independentes. Pausas/falhas são apenas seams do harness, não flags de transporte ou produção. Incluem SIGTERM, SIGKILL, crash após commit/publicação, reinícios, 50 duplicatas com três consumidores/grupos distintos e reconciliação. As tentativas anteriores no sandbox falharam no setup por ECONNREFUSED. Posteriormente, Luís confirmou a regressão externa completa aprovada, incluindo CP-05. O histórico da falha de long polling, correção do harness e limites do diagnóstico original está preservado em IMP-03-EVIDENCE.md; passar na regressão não reconstitui o trace ausente da falha anterior.
+- **Construtores Privados e Factories Estáticas:** Todas as classes de domínio utilizam construtor `private` (ou `protected` na classe abstrata `IntegrationEvent`) e campos privados ECMAScript (`#`). A criação de instâncias ocorre por meio de factories explícitas (`Money.from`, `Wallet.open`, `WagerTransaction.create`, `WagerTransaction.createOpening`, `WalletLedgerEntry.create`, `InboxMessage.receive`, `OutboxMessage.enqueue`) que validam todas as invariantes na entrada.
+- **Factories de Reidratação (`rehydrate`):** Os adaptadores de persistência reconstroem instâncias de domínio usando `static rehydrate(state)`. A reidratação copia datas e congela estruturas sem reexecutar transições de negócio, incrementar versões ou emitir novos eventos.
+- **Cópia Defensiva e Imutabilidade:** Instâncias de domínio são congeladas via `Object.freeze`. Todas as propriedades `Date` são clonadas na entrada e em cada getter. Payloads JSON de eventos são copiados e congelados recursivamente.
+- **Política de Identificadores (`ARC2-02`):** IDs de entidades internas (`walletId`, `transactionId`, `ledgerEntryId`, `eventId`) são UUIDs minúsculos gerados via `node:crypto.randomUUID()`. Identificadores externos (`playerId`, `providerId`, `externalTransactionId`, `referenceExternalTransactionId`, `idempotencyKey`, `roundId`, `gameId`, `messageId`) são strings `TEXT` não vazias e sem espaços nas extremidades (`wallets.player_id` e `wager_transactions.player_id` usam `TEXT` no PostgreSQL).
 
-Decisão formal de Luís Henrique Pereira — TTL, Opção A: o TTL limita a espera por referências indisponíveis. Se a referência já estiver válida no momento da avaliação transacional, a operação poderá ser processada mesmo após o prazo de espera. Essa decisão resolve a ambiguidade identificada em §5 (limite de espera versus ausência após tentativas/TTL) e confirma o teste `available valid reference is processed even when worker scan was delayed beyond the waiting TTL`. Nenhum comportamento financeiro foi alterado para registrar o aceite. Revisão independente do IMP-03 continua pendente; documentos normativos preservados.
+---
 
-### IMP-03/REV3-FIX-01 — correção e cobertura dos entrypoints
+### 4. Money e Precisão Decimal
 
-Checkpoint autorizado por Luís após o parecer independente REV3 de reprovação temporária. REV3-01 corrigido pelo tratamento conservador de unknown descrito acima; nenhuma nova taxonomia de erros, camada persistente ou mecanismo de redrive. Erros permanentes continuam no contrato manual anterior. Classificação não altera a exceção/causa recebida. TTL, domínio, migrations, PendingReferenceWorker e Publisher preservados.
+[`Money`](src/shared/domain/money.ts) encapsula valores monetários decimais exatos usando um construtor dedicado `Decimal.clone({ precision: 40 })` de `decimal.js` `10.6.0`:
 
-Testes de Consumer cobrem erro sem code, rollback real antes do commit, perda de confirmação depois do commit, redrive nativo com igualdade do corpo e identidades, replay operacional da DLQ e duplicata posterior com um único efeito financeiro. A falha sem code é injetada usando DriverException do MikroORM instalado; não se alega desconexão física de PostgreSQL nessa prova.
+- **Ausência Absoluta de Ponto Flutuante:** Valores monetários nunca são convertidos para `number` do JavaScript no domínio, na aplicação ou na persistência. O [`ExactNumericType`](src/database/exact-numeric-type.ts) rejeita valores `number` na fronteira do driver MikroORM e mapeia colunas `NUMERIC(18,2)` do PostgreSQL estritamente como strings decimais.
+- **Validação Estrita de Formato e Faixa:** Entradas externas devem satisfazer `/^(?:0|[1-9]\d{0,15})\.\d{2}$/` (escala fixa de 2 casas decimais, até 16 dígitos inteiros, sem sinal, sem zeros à esquerda redundantes, sem espaços, sem notação científica, sem `NaN` ou `Infinity`).
+- **Valor Máximo Suportado:** `9999999999999999.99` (teto de `NUMERIC(18,2)`). Qualquer adição ou subtração que ultrapasse esse limite lança [`MoneyOverflowError`](src/shared/domain/domain-errors.ts).
+- **Segurança de Moeda:** Os códigos de moeda são validados contra a lista ISO-4217 suportada por `Intl.supportedValuesOf('currency')` no runtime Bun fixado (`BRL` é a moeda operacional principal; `USD` e rejeição entre moedas distintas são exercitados nas suítes unitárias e de integração). Operações binárias (`add`, `subtract`, `isLessThan`, `equals`) lançam [`CurrencyMismatchError`](src/shared/domain/domain-errors.ts) quando as moedas divergem.
 
-REV3-02: `test/integration/worker-entrypoints.test.ts` executa os três scripts reais em processos Bun, portanto as composições MessagingModule.forConsumer/forPublisher e WageringModule.forPendingReferences. O preload exclusivo de teste adapta somente as opções de MikroORM.init para schema descartável e search_path sem fallback public, pois databaseConfig de produção fixa public. Não substitui DynamicModules, providers, regras, SDK ou transações. Valida URL jungle_test/loopback, nomes de filas isoladas e schema antes do spawn; na conexão do processo filho comprova current_database, current_schema e presença das cinco tabelas antes de devolver ORM ao Nest e iniciar loops. Adapters reais resolvem filas e conferem FIFO/redrive.
+---
 
-Observadores de teste delegam init/close/send/destroy reais e emitem apenas fases. Verificam trabalho financeiro/publicação/resolução, dois DeleteMessage confirmados para duplicatas do Consumer, SIGTERM, drenagem antes de pool.close, pool desconectado, SDK destruído quando aplicável, ausência de sessões do processo e reinício sem novos efeitos financeiros. Cada script também tem startup inválido com exit 1 e diagnóstico sanitizado. Essa adaptação não acrescenta uma opção de schema à configuração pública de produção.
+### 5. Agregado Wallet
 
-Validação efetivamente executada pelo Codex neste checkpoint: RED unitário com três falhas de preservação do original; GREEN completo de **366 testes, 0 falhas, 2753 asserções, 31 arquivos**, typecheck, bootstrap HTTP em jungle_test e verificação SQS aprovados. Smokes: **6/6, 134 asserções**; detalhes, limitações e rollback em IMP-03-EVIDENCE.md. Os resultados externos anteriores de Luís permanecem históricos e não são somados a esta execução. Checkpoint tecnicamente validado; IMP-03 aguarda revisão independente complementar e aprovação humana para commit. Sem commit/push ou início do IMP-04.
+[`Wallet`](src/modules/wallets/domain/wallet.ts) é a raiz de agregado e a unidade de concorrência para um par `(playerId, currency)`:
 
+- **Abertura (`Wallet.open` e `createWalletOpening`):** Inicializa `version = 1`. Se `initialBalance` for positivo, [`createWalletOpening`](src/modules/wagering/domain/wallet-opening.ts) constrói atomicamente a `Wallet`, uma `WagerTransaction` interna `OPENING` (já em estado `PROCESSED`, com `providerId = "SYSTEM"`, `externalTransactionId = "opening:<walletId>"`, `idempotencyKey = "SYSTEM:opening:<walletId>"`, `gameId = "SYSTEM_OPENING"`), um lançamento `CREDIT` em `WalletLedgerEntry` e dois eventos de Outbox (`WagerTransactionProcessed` e `WalletBalanceChanged`). Se `initialBalance` for `0.00`, apenas o registro de `Wallet` é criado.
+- **Movimentações de Saldo (`debit` e `credit`):** Ambos os métodos validam compatibilidade de moeda e valor positivo, calculam o novo saldo e o `WalletLedgerEntry` **antes** de mutar o estado privado (`#balance`, `#version`, `#updatedAt`) e incrementam `version` em `1`. Se um débito exceder `#balance`, `debit` lança erro com o `FailureCode` informado (`INSUFFICIENT_FUNDS_BET` ou `INSUFFICIENT_FUNDS_REVERSAL`); se um crédito exceder `NUMERIC(18,2)`, `Money.add` lança `MoneyOverflowError` antes de modificar qualquer campo da `Wallet`.
 
-### IMP-03-CLOSE — aprovação técnica e limites do parecer
+---
 
-Parecer complementar Antigravity comunicado por Luís: **APROVAR REV3-FIX-01**, sem bloqueantes; identificação exibida Gemini 4 Argon — medium. Confirmou unknown sem DLQ manual/DeleteMessage por esgotamento, redrive nativo preservando envelope/identidades, replay financeiro único, permanentes preservados, segurança de ACK/visibilidade/commit e ausência de exposição adicional ou retry infinito fora da retenção/política. Para REV3-02, confirmou cobertura dos três scripts reais e seus módulos Nest, recursos isolados, trabalho, SIGTERM, fechamento, reinício, idempotência e startup inválido.
+### 6. Agregado WagerTransaction
 
-A revisão foi predominantemente estática: o revisor executou typecheck, 259 unitários e diff-check; não repetiu integrações. Os 366 testes/0 falhas/2753 asserções/31 arquivos e integrações reais permanecem evidência anterior do Codex no REV3-FIX-01. Esta consolidação não executou testes. O parecer supera o estado anterior de revisão complementar pendente; aprovação técnica não autoriza versionamento.
+[`WagerTransaction`](src/modules/wagering/domain/wager-transaction.ts) modela o ciclo de vida e o snapshot auditável de cada operação de aposta:
 
-Riscos não bloqueantes: **R1**, DLQ mista com WagerTransactionDeadLetter (diagnóstico) e WagerTransactionRequested (original nativo), exigindo distinguir tipos na recuperação e nunca reenviar diagnóstico financeiro; **R2**, preload dos smokes adapta somente schema de teste, mantendo módulos reais; **R3**, API HTTP, observabilidade e VAL02-01 permanecem no IMP-04. REV3-03 (visibilidade reduzida), REV3-04 (tempo anterior ao lock) e REV3-05 (força da prova de exclusão) preservam propostas de avaliação no IMP-04, sem correção declarada. REV3-06 é política intencional documentada: janela nominal de 1023s por tentativas, antes de TTL de 24h; Opção A preservada. REV3-07 recebe atualização documental nos três arquivos autorizados, sem declarar limpeza de todo o histórico. O quadro detalhado em IMP-03-EVIDENCE.md preserva classificações e não cria novos aceites de implementação.
+```text
+PENDING           -> PROCESSED | PENDING_REFERENCE | REJECTED | FAILED
+PENDING_REFERENCE -> PROCESSED | REJECTED | FAILED
+PROCESSED / REJECTED / FAILED -> Terminal (nenhuma transição subsequente permitida)
+```
 
-**IMP-03 TECNICAMENTE APROVADO. VERSIONAMENTO PENDENTE DE AUTORIZAÇÃO HUMANA de Luís Henrique Pereira.** Somente documentos consolidados; inventário revisável de 61 arquivos no relatório. Nenhum staging, commit/push ou início do IMP-04.
+- **Criação Externa vs Interna:** `WagerTransaction.create` rejeita `kind === "OPENING"` e `providerId === "SYSTEM"`. `BET` e `LOSS` rejeitam `referenceExternalTransactionId`; `REFUND` e `ROLLBACK` exigem `referenceExternalTransactionId`; `WIN` aceita `referenceExternalTransactionId` opcional. Autorreferência (`referenceExternalTransactionId === externalTransactionId`) é rejeitada.
+- **Snapshot Histórico de Saldo (`recordedBalance`):** `markProcessed`, `reject`, `markPendingReference` e `fail` registram o saldo da carteira observado no momento da avaliação (`recorded_balance_amount` e `recorded_balance_currency`). Em rejeições por `CURRENCY_MISMATCH`, `money` preserva a moeda enviada no payload enquanto `recordedBalance` preserva a moeda real da carteira. Snapshots terminais são imutáveis.
+- **Taxonomia de Códigos de Falha (`FailureCode`):**
+
+| `FailureCode` | Status Terminal | Significado |
+|---|---|---|
+| `INSUFFICIENT_FUNDS_BET` | `REJECTED` | Valor da `BET` excede o saldo disponível na carteira |
+| `INSUFFICIENT_FUNDS_REVERSAL` | `REJECTED` | Débito de `ROLLBACK` (revertendo `WIN` ou `REFUND`) excede o saldo disponível |
+| `CURRENCY_MISMATCH` | `REJECTED` | Moeda da operação difere da moeda da carteira |
+| `REFERENCE_NOT_FOUND_TIMEOUT` | `REJECTED` | Transação referenciada permaneceu indisponível após `maxAttempts` ou `TTL` |
+| `REFERENCE_INVALID_KIND` | `REJECTED` | `kind` da transação referenciada é incompatível com `WIN`, `REFUND` ou `ROLLBACK` |
+| `REFERENCE_CONTEXT_MISMATCH` | `REJECTED` | Transação referenciada pertence a outro jogador, carteira, rodada ou moeda |
+| `REFERENCE_AMOUNT_MISMATCH` | `REJECTED` | Valor de `REFUND` ou `ROLLBACK` difere do valor da transação referenciada |
+| `REFERENCE_NOT_PROCESSED` | `REJECTED` | Transação referenciada está em estado terminal não processado (`REJECTED` ou `FAILED`) |
+| `REFERENCE_ALREADY_REVERSED` | `REJECTED` | Transação referenciada já possui uma reversão `REFUND`/`ROLLBACK` processada |
+| `INFRASTRUCTURE_PERMANENT` | `FAILED` | Falha permanente de infraestrutura/representação (como overflow `NUMERIC(18,2)` durante resolução de `PENDING_REFERENCE`) |
+
+---
+
+### 7. Ledger Imutável (`WalletLedgerEntry`)
+
+[`WalletLedgerEntry`](src/modules/wallets/domain/wallet-ledger-entry.ts) é um registro financeiro append-only sem campos mutáveis e sem métodos de transição:
+
+- `WalletLedgerEntry.create` verifica que `money.isPositive()`, que `money`, `balanceBefore` e `balanceAfter` possuem a mesma moeda e que `isBalanced()` é verdadeiro (`balanceBefore + money == balanceAfter` para `CREDIT`; `balanceBefore - money == balanceAfter` para `DEBIT`).
+- Toda transação financeira (`BET`, `WIN`, `REFUND`, `ROLLBACK`, `OPENING`) que atinge `PROCESSED` produz exatamente um `WalletLedgerEntry` (`uq_ledger_transaction`).
+- Operações sem movimentação de saldo (`LOSS`) e transações não processadas (`PENDING_REFERENCE`, `REJECTED`, `FAILED`) nunca geram lançamentos no ledger.
+
+---
+
+### 8. Transactional Inbox (`InboxMessage`)
+
+[`InboxMessage`](src/modules/messaging/domain/inbox-message.ts) provê deduplicação persistente para entregas SQS identificada por `(consumer_name, message_id)`:
+
+- Reivindicada dentro da mesma transação PostgreSQL da operação financeira via `INSERT INTO inbox_messages ... ON CONFLICT (consumer_name, message_id) DO NOTHING RETURNING *`.
+- Armazena `payload_hash` (o hash SHA-256 canônico do payload de negócio da aposta) e `processed_at`.
+- Se uma mensagem duplicada `(consumer_name, message_id)` chegar com `payload_hash` divergente, `assertSamePayload` lança `IdempotencyConflictError`.
+- Se uma reentrega chegar com um novo `message_id` para uma `idempotency_key` já confirmada, o novo registro `InboxMessage` é marcado com `processed_at` e commitado na mesma transação, retornando o replay idempotente da transação vencedora sem duplicar movimentações financeiras ou eventos de Outbox.
+
+---
+
+### 9. Transactional Outbox (`OutboxMessage` e `IntegrationEvent`)
+
+[`IntegrationEvent`](src/shared/domain/events/integration-event.ts) e [`OutboxMessage`](src/modules/messaging/domain/outbox-message.ts) garantem que eventos de integração nunca sejam publicados antes do commit no banco e nunca sejam perdidos caso o processo falhe após o commit:
+
+- **Subclasses Concretas de Eventos (`version = 1`, `aggregateId = walletId`):**
+  1. [`WagerTransactionProcessed`](src/modules/wagering/domain/events/wager-transaction-processed.ts) — emitido quando qualquer aposta (incluindo `LOSS` e `OPENING` positivo) transiciona para `PROCESSED`.
+  2. [`WagerTransactionRejected`](src/modules/wagering/domain/events/wager-transaction-rejected.ts) — emitido quando uma aposta transiciona para `REJECTED`.
+  3. [`WalletBalanceChanged`](src/modules/wallets/domain/events/wallet-balance-changed.ts) — emitido **somente** quando o saldo da carteira muda (`BET`, `WIN`, `REFUND`, `ROLLBACK`, `OPENING` positivo).
+  4. [`WagerTransactionPendingReference`](src/modules/wagering/domain/events/wager-transaction-pending-reference.ts) — emitido uma única vez quando uma aposta é inicialmente aceita como `PENDING_REFERENCE`.
+- `OutboxMessage` utiliza `eventId` como chave primária (`id`), persiste o envelope JSON serializado (strings `MoneyProps`, nunca instâncias `Money`), inicia com `attempts = 0` e `nextAttemptAt = occurredAt` e calcula backoff exponencial determinístico em retentativas: `min(maxDelayMs, baseDelayMs * 2^(attempts - 1))` (defaults: `baseDelayMs = 1000` ms, `maxDelayMs = 60000` ms). Eventos da Outbox nunca são descartados por esgotamento de tentativas.
+
+---
+
+### 10. Unit of Work (`FinancialUnitOfWork` e `PostgresUnitOfWork`)
+
+[`FinancialUnitOfWork`](src/shared/application/financial-store.ts) e sua implementação PostgreSQL [`PostgresUnitOfWork`](src/database/postgres-unit-of-work.ts) isolam cada tentativa transacional:
+
+- Cada chamada a `uow.run(work, options)` cria um fork limpo do `EntityManager` do MikroORM (`orm.em.fork({ clear: true })`) e executa dentro de `em.transactional(..., { isolationLevel })`.
+- [`PostgresFinancialStore`](src/database/postgres-financial-store.ts) executa instruções SQL parametrizadas explícitas no `SqlEntityManager` transacional em vez de depender da ordem implícita de flush do Identity Map do ORM. Isso torna a ordem de aquisição de locks, a classificação de violações de constraints e a verificação de linhas afetadas (`updateWallet`, `updatePendingWager`, `completeOutbox`, `failOutbox`) completamente determinísticas.
+
+---
+
+### 11. Transações PostgreSQL e Isolamento
+
+- **Operações de Escrita (`CreateWalletUseCase`, `ProcessWagerTransactionUseCase`, `PendingReferenceWorker`, `OutboxPublisher`):** Executam sob nível de isolamento `READ COMMITTED` combinado com locks pessimistas explícitos `FOR UPDATE`. Como a `Wallet` é sempre bloqueada primeiro via `SELECT ... FROM wallets WHERE id = ? FOR UPDATE`, o PostgreSQL relê a versão mais recente confirmada da linha ao adquirir o lock, impedindo lost updates e write skew sobre o saldo.
+- **Reconciliação (`ReconcileWalletUseCase`):** Executa sob isolamento `REPEATABLE READ` (`IsolationLevel.REPEATABLE_READ`) para que a leitura de `wallets.balance` e a agregação `SUM(wallet_ledger_entries)` observem um único snapshot MVCC consistente sem bloquear escritores concorrentes.
+- **Retentativas de Falhas Transitórias (`execution.ts`):** Deadlocks (`40P01`), falhas de serialização (`40001`), lock timeouts (`55P03`), statement timeouts (`57014`) e erros transitórios de conexão abortam a transação atual por completo, aguardam fora de qualquer transação (`retryDelay`) e repetem a operação em um novo fork do `EntityManager` até `maxAttempts` (`3` por padrão).
+
+---
+
+### 12. Locks Pessimistas e Ordem de Aquisição
+
+Para eliminar deadlocks entre requisições HTTP concorrentes, consumidores SQS e instâncias do `PendingReferenceWorker`, toda transação financeira de escrita respeita uma hierarquia estrita de locks (`ARC2-01`):
+
+1. **Leitura Prévia de Identidade (Sem Lock):** `findIdentity(idempotencyKey, providerId, externalTransactionId)` verifica se a chave ou ID externo já foi confirmado. Isso garante que uma chave previamente utilizada com payload divergente ou carteira inexistente lance imediatamente `IdempotencyConflictError`.
+2. **Lock 1 — `Wallet FOR UPDATE`:** `SELECT ... FROM wallets WHERE id = ? FOR UPDATE` é sempre o **primeiro** lock de linha adquirido em qualquer transação financeira.
+3. **Lock 2 — `Claim da Inbox` (apenas canal SQS):** `INSERT INTO inbox_messages ... ON CONFLICT DO NOTHING RETURNING *` executa imediatamente após o lock da carteira e antes de bloquear ou inserir apostas.
+4. **Lock 3 — `Wager / Referência da Mesma Carteira FOR UPDATE`:**
+   - Em `ProcessWagerTransactionUseCase`: se a transação referenciada existir e pertencer à **mesma** carteira (`reference.walletId === wallet.id`), ela é bloqueada via `SELECT ... FROM wager_transactions WHERE id = ? FOR UPDATE`.
+   - Em `PendingReferenceWorker`: após bloquear `Wallet FOR UPDATE` e confirmar o vínculo da candidata, a aposta pendente é bloqueada (`getWager(id, true)`), seguida pela aposta referenciada (`getWager(ref.id, true)`) **somente se** `ref.walletId === wallet.id`.
+5. **Ausência de Locks Cruzados entre Carteiras:** Uma operação nunca adquire lock sobre uma segunda carteira nem sobre uma aposta pertencente a outra carteira. Se a referência pertencer a outra carteira, `evaluateWager` a rejeita como `REFERENCE_CONTEXT_MISMATCH` usando apenas a leitura sem lock.
+
+---
+
+### 13. Idempotência Persistente e Hash Canônico
+
+- **Hash Canônico de Payload (`wager-payload.ts`):** [`canonicalWagerPayload`](src/modules/wagering/application/wager-payload.ts) normaliza `money` via `Money.from(input.money).toJSON()`, normaliza `referenceExternalTransactionId` ausente para `null`, ordena lexicograficamente todas as chaves dos objetos JSON em cada nível e calcula o resumo `SHA-256` hexadecimal minúsculo (`wagerPayloadHash`). Metadados de transporte (nome do header `Idempotency-Key`, `correlationId`, `messageId` do SQS, `occurredAt`, `ReceiptHandle`) não entram no hash.
+- **Dupla Autoridade de Unicidade no SQL:** O PostgreSQL impõe `uq_wager_idempotency` (`UNIQUE (idempotency_key)`) e `uq_wager_provider_external` (`UNIQUE (provider_id, external_transaction_id)`).
+- **Replay vs Conflito:**
+  - Se uma requisição corresponder a uma aposta confirmada em **todos** os campos `idempotencyKey`, `providerId`, `externalTransactionId` e `payloadHash`, `assertReplay` tem sucesso e o caso de uso retorna `recordedBalance`, `status` e `failureCode` persistidos com `idempotentReplay: true`.
+  - Se `idempotencyKey` e `(providerId, externalTransactionId)` apontarem para duas linhas distintas, ou se qualquer um dos campos `providerId`, `externalTransactionId`, `idempotencyKey` ou `payloadHash` divergir do vencedor confirmado, `IdempotencyConflictError` (`409 Conflict`) é lançado sem alterar nenhuma carteira.
+
+---
+
+### 14. Concorrência Distribuída
+
+O sistema opera com segurança com 3 ou mais processos simultâneos:
+
+- **Serialização em Hot Wallet:** Apostas ou reversões concorrentes sobre o mesmo `walletId` são serializadas em `SELECT ... FROM wallets WHERE id = ? FOR UPDATE`. No cenário obrigatório do desafio (saldo inicial `100.00 BRL`, duas apostas simultâneas de `80.00 BRL`), a primeira transação debita para `20.00 BRL` (`version = 2`, `PROCESSED`) e confirma; a segunda adquire o lock em seguida, observa `20.00 BRL`, grava a aposta como `REJECTED` (`INSUFFICIENT_FUNDS_BET`, `recordedBalance = 20.00 BRL`) e confirma sem alterar o saldo ou o ledger.
+- **Paralelismo entre Carteiras Distintas:** Operações em `walletId`s diferentes bloqueiam linhas disjuntas em `wallets` e executam em paralelo sem contenção.
+- **Corrida de Colisão de Chave entre Carteiras Distintas:** Se duas requisições concorrentes reutilizarem a mesma `idempotency_key` apontando para duas carteiras **distintas** (`walletA` e `walletB`), ambas podem bloquear suas respectivas carteiras simultaneamente e o segundo `INSERT INTO wager_transactions` falha com `SQLSTATE 23505` (`uq_wager_idempotency`). O `ProcessWagerTransactionUseCase` captura `23505` nas constraints de unicidade de negócio, permite o rollback completo da transação perdedora (deixando a carteira perdedora intocada), relê o vencedor confirmado em uma nova transação somente leitura e lança `IdempotencyConflictError` (ou retorna replay caso idêntica).
+
+---
+
+### 15. Reversões e Referências Fora de Ordem
+
+[`evaluateWager`](src/modules/wagering/domain/wager-rules.ts) é uma função pura de decisão que avalia regras de referência e saldo sob o lock da carteira:
+
+- **Resolução da Referência:** Localizada por `(providerId, referenceExternalTransactionId)`. Deve pertencer ao mesmo `playerId`, `walletId`, `roundId` e `currency` (`REFERENCE_CONTEXT_MISMATCH` caso contrário).
+- **Tipos Permitidos de Referência:**
+  - `WIN` (quando `referenceExternalTransactionId` é informado) deve referenciar uma `BET`.
+  - `REFUND` deve referenciar uma `BET` (`REFERENCE_INVALID_KIND` caso contrário).
+  - `ROLLBACK` deve referenciar uma `BET`, `WIN` ou `REFUND` (`REFERENCE_INVALID_KIND` caso contrário).
+- **Igualdade Exata de Valor em Reversões:** `REFUND` e `ROLLBACK` exigem `money.equals(reference.money)` (`REFERENCE_AMOUNT_MISMATCH` caso contrário). `WIN` pode ter qualquer valor positivo.
+- **Invariante de Reversão Única:** Uma transação referenciada pode ter no máximo **uma** reversão `PROCESSED` (`REFUND` ou `ROLLBACK`), imposta tanto nas regras de domínio (`referenceAlreadyReversed`, incluindo a rejeição de uma `WIN` tardia sobre uma `BET` já revertida) quanto no banco de dados pelo índice único parcial `uq_wager_processed_reversal`. Reversões encadeadas (`BET -> REFUND -> ROLLBACK(ref=REFUND)`) são permitidas porque o `ROLLBACK` referencia a transação `REFUND`, e não a `BET` já revertida.
+- **Chegada Fora de Ordem:** Quando a referência ainda não existe em `wager_transactions` ou ainda está em estado não terminal (`PENDING` / `PENDING_REFERENCE`), `evaluateWager` retorna `{ status: 'PENDING_REFERENCE' }`. Se a referência já estiver em estado terminal `REJECTED` ou `FAILED`, `evaluateWager` rejeita imediatamente a operação dependente com `REFERENCE_NOT_PROCESSED`.
+
+---
+
+### 16. PendingReferenceWorker e Tratamento Terminal de Overflow (`FIX-D02`)
+
+[`PendingReferenceWorker`](src/modules/wagering/application/pending-reference-worker.ts) e [`pending-reference-policy.ts`](src/modules/wagering/application/pending-reference-policy.ts) gerenciam o ciclo de vida das transações `PENDING_REFERENCE`:
+
+- **Política Compartilhada (`pending-reference-policy.ts`):** Tanto o aceite inicial em `ProcessWagerTransactionUseCase` quanto as retentativas no `PendingReferenceWorker` compartilham `PENDING_REF_BASE_DELAY_MS` (`1000` ms), `PENDING_REF_MAX_ATTEMPTS` (`10`) e `PENDING_REF_TTL_MS` (`86400000` ms / 24h).
+- **Descoberta Sem Lock e Isolamento por Candidata:** `findDuePendingWagers(now, limit)` consulta `status = 'PENDING_REFERENCE' AND next_retry_at <= ?` ordenado por `(next_retry_at ASC, created_at ASC, id ASC)` sem manter locks de linha. Cada candidata é processada em sua própria UoW isolada (`Wallet FOR UPDATE` -> verificação de vínculo -> `Wager FOR UPDATE` -> revalidação com `now = runtime.now()` -> `Reference FOR UPDATE` da mesma carteira). Uma falha em uma candidata nunca aborta nem bloqueia as demais candidatas do lote.
+- **Semântica do TTL (Opção A Aprovada):** `expiresAt` limita o tempo de espera por uma referência **indisponível**. Se a transação referenciada já estiver disponível e válida no momento em que o `PendingReferenceWorker` avalia a candidata, a operação é processada normalmente mesmo que a varredura do worker tenha atrasado além de `expiresAt`. Se a referência continuar ausente/pendente e `attempts + 1 >= maxAttempts`, `now >= expiresAt` ou o próximo instante de backoff `nextRetryAt >= expiresAt`, a transação transiciona para `REJECTED` com `FailureCode.ReferenceNotFoundTimeout` (`REFERENCE_NOT_FOUND_TIMEOUT`) e enfileira `WagerTransactionRejected`.
+- **Tratamento Terminal de Overflow (`FIX-D02`):**
+  - Se uma operação `WIN`, `REFUND` ou `ROLLBACK` foi aceita inicialmente como `PENDING_REFERENCE` e, quando sua referência fica disponível, o saldo da carteira cresceu para próximo de `9999999999999999.99` (teto de `NUMERIC(18,2)`), a execução de `wallet.credit(...)` lança [`MoneyOverflowError`](src/shared/domain/domain-errors.ts) antes de mutar a `wallet`.
+  - Em vez de deixar `MoneyOverflowError` escapar como exceção não tratada (o que manteria `attempts` e `next_retry_at` inalterados em retry infinito) ou classificá-lo indevidamente como `REFERENCE_NOT_FOUND_TIMEOUT`, o `PendingReferenceWorker` captura `MoneyOverflowError` no cálculo do movimento e transiciona a transação `PENDING_REFERENCE -> FAILED` com `FailureCode.InfrastructurePermanent` (`INFRASTRUCTURE_PERMANENT`) e `wallet.balance` como snapshot observado:
+    - Invoca `wager.fail(FailureCode.InfrastructurePermanent, wallet.balance)` (limpando `nextRetryAt` e `expiresAt`).
+    - Persiste `store.updatePendingWager(wager)` na mesma transação sob locks `Wallet -> Wager` (exigindo `1` linha afetada ou abortando com `PersistenceInvariantError`).
+    - **Não** altera `wallets.balance`, `wallets.version` nem `wallet_ledger_entries`, e **não** enfileira eventos `Processed`, `Rejected` ou `BalanceChanged` na Outbox.
+    - Emite log operacional estruturado (`event: "pending_reference_failed"`, `code: "MONEY_OVERFLOW"`, `failureCode: "INFRASTRUCTURE_PERMANENT"`) e a métrica `wager-status: "FAILED"` **após** o commit no banco.
+    - Varreduras subsequentes do worker ignoram o registro terminal, e replays HTTP/SQS devolvem o snapshot `FAILED` persistido (`422 Unprocessable Entity` no HTTP, `ACK` no SQS).
+
+---
+
+### 17. SQS Consumer
+
+[`SqsWagerConsumer`](src/modules/messaging/application/sqs-wager-consumer.ts) (entrypoint [`scripts/consume-wagers.ts`](scripts/consume-wagers.ts)) consome mensagens da fila `wager-transactions.fifo`:
+
+- **Verificação de Inicialização:** Confere que `wager-transactions.fifo` e `wager-transactions-dlq.fifo` existem, são filas FIFO com `ContentBasedDeduplication = "false"` e que `wager-transactions.fifo` possui `RedrivePolicy` apontando para o ARN da DLQ com `maxReceiveCount === SQS_MAX_RECEIVE_COUNT` (`5`).
+- **Garantia de ACK Pós-Commit:** `DeleteMessage` é executado **somente** após o commit de `ProcessWagerTransactionUseCase.execute` (`PROCESSED`, `REJECTED`, `PENDING_REFERENCE` ou replay idempotente, incluindo `FAILED` histórico). Se `DeleteMessage` falhar após o commit, o consumidor registra `ACK_FAILED` e retorna `'ack-failed'`; a reentrega subsequente do SQS encontra o registro já confirmado em `inbox_messages` / `wager_transactions` e conclui o ACK como replay idempotente.
+- **Classificação de Erros (`REV3-FIX-01`):**
+  - **Erros Permanentes de Contrato/Identidade** (`InvalidJsonEnvelope`, `InvalidDomainInputError`, `InvalidMoneyError`, `MoneyOverflowError`, `CurrencyMismatchError`, `IdempotencyConflictError`): Encaminhados manualmente para `wager-transactions-dlq.fifo` como diagnóstico JSON sanitizado `WagerTransactionDeadLetter` (contendo `messageId`, `sqsMessageId`, `payloadHash`, `errorCode`, `receiveCount` e `failedAt`, omitindo payloads financeiros brutos e segredos). A mensagem de origem só é removida **após** a confirmação de `SendMessage` na DLQ.
+  - **Erros Transitórios e Desconhecidos** (`NotFoundError`, PostgreSQL `40P01`/`40001`/`55P03`/`57014`/`08*`/`57P*`/`53300`, timeouts de rede e exceções sem código reconhecido): Nunca provocam envio manual à DLQ nem `DeleteMessage`. O consumidor aplica backoff de visibilidade (`ChangeMessageVisibility`) e delega à `RedrivePolicy` nativa do SQS a transferência do envelope original `WagerTransactionRequested` para a DLQ após `maxReceiveCount` recebimentos.
+
+---
+
+### 18. OutboxPublisher
+
+[`OutboxPublisher`](src/modules/messaging/application/outbox-publisher.ts) (entrypoint [`scripts/publish-outbox.ts`](scripts/publish-outbox.ts)) publica eventos de integração confirmados de `outbox_messages` para `wagering-events.fifo`:
+
+1. **Claim com Lease (`claimOutbox`):** Em uma transação curta, seleciona um evento vencido (`published_at IS NULL AND next_attempt_at <= ? AND (claimed_until IS NULL OR claimed_until <= ?)`) ordenado por `(next_attempt_at ASC, occurred_at ASC, id ASC)` usando `FOR UPDATE SKIP LOCKED`, grava `claim_owner`, um novo UUID `claim_token` e `claimed_until = now + leaseMs` (`10000` ms por padrão), e confirma o commit.
+2. **Verificação de Margem de Lease Antes do Envio:** Antes de chamar o SQS fora da transação SQL, verifica que `claimed_until - now >= sendTimeoutMs + 1000` (`3000` ms + `1000` ms de margem).
+3. **Publicação SQS:** Publica o envelope JSON imutável em `wagering-events.fifo` com `MessageGroupId = aggregateId` (`walletId`) e `MessageDeduplicationId = eventId`, limitado por `AbortSignal.timeout(sendTimeoutMs)`.
+4. **Confirmação com Fencing de Lease (`completeOutbox` / `failOutbox`):** Abre uma segunda transação executando `UPDATE outbox_messages SET published_at = ?, claim_owner = NULL, claim_token = NULL, claimed_until = NULL WHERE id = ? AND published_at IS NULL AND claim_owner = ? AND claim_token = ? AND claimed_until > ?`. Se o lease de um publisher lento tiver expirado e outro publisher já tiver assumido o registro, o `UPDATE` com fencing afeta `0` linhas (`false`), impedindo que o owner antigo sobrescreva o estado.
+
+---
+
+### 19. Retry, Backoff e Dead-Letter Queue (DLQ)
+
+| Subsistema | Gatilho de Retry | Estratégia de Backoff | Comportamento no Esgotamento |
+|---|---|---|---|
+| **UoW PostgreSQL** (`ProcessWager`, `CreateWallet`, `PendingRef`) | `40P01`, `40001`, `55P03`, `57014`, `23505` (colisão concorrente de unicidade de negócio) | `20ms * 2^attempt` fora da transação (`maxAttempts = 3`) | Lança `RetryExhaustedError` (`503` no HTTP; retry transitório de visibilidade no SQS) |
+| **SQS Consumer** (`SqsWagerConsumer`) | Erro transitório de banco/rede, carteira ausente (`NotFoundError`) ou erro desconhecido | Backoff em `ChangeMessageVisibility` (`min(visibilityTimeout, 2^(receiveCount - 1))`) | `RedrivePolicy` nativa do SQS move a mensagem original para `wager-transactions-dlq.fifo` após `5` recebimentos |
+| **SQS Consumer (Erros Permanentes)** | JSON malformado, DTO/Money inválido, `IdempotencyConflictError` | Imediato (`0` retries) | Envia diagnóstico sanitizado `WagerTransactionDeadLetter` para a DLQ, seguido de `DeleteMessage` na fila de entrada |
+| **Outbox Publisher** (`OutboxPublisher`) | Erro ou timeout no `SendMessage` do SQS | `min(60000ms, 1000ms * 2^(attempts - 1))` via `failOutbox` | Retenta indefinidamente até confirmar publicação (nenhum evento é descartado) |
+| **Referência Pendente** (`PendingReferenceWorker`) | Transação referenciada ausente ou ainda não terminal | `1000ms * 2^attempts` (`maxAttempts = 10`, `TTL = 86400000ms`) | Transiciona a aposta para `REJECTED` (`REFERENCE_NOT_FOUND_TIMEOUT`) e enfileira `WagerTransactionRejected` |
+
+---
+
+### 20. Recuperação após Falhas e Shutdown Coordenado
+
+- **Shutdown Coordenado de Workers (`worker-shutdown.ts`, `worker-signals.ts`):**
+  - Os workers standalone (`consume-wagers.ts`, `publish-outbox.ts`, `resolve-pending-references.ts`) registram handlers `SIGTERM`/`SIGINT` via [`enableWorkerSignals`](src/shared/application/worker-signals.ts) (chamadores programáticos utilizam `closeWorkerApplication`).
+  - Ao receber o sinal, `WorkerShutdown` arma um watchdog timer (`WORKER_SHUTDOWN_TIMEOUT_MS`, default `60000` ms), cancela long pollings ociosos via `AbortSignal`, aguarda a conclusão da operação em andamento enquanto o pool PostgreSQL permanece aberto (permitindo concluir o ACK SQS pós-commit ou a confirmação da Outbox) e, em seguida, invoca `app.close(signal)` para fechar o MikroORM e destruir os clientes SQS antes de desarmar o watchdog.
+  - Se um long polling SQS retornar uma mensagem após o início do shutdown, o consumidor devolve imediatamente a visibilidade (`ChangeMessageVisibility(0)`) sem processá-la nem fazer ACK.
+  - Se o prazo do watchdog expirar durante a drenagem ou fechamento de recursos, o processo encerra com `process.exit(1)` para recuperação limpa pelo supervisor.
+- **Consistência ante Falhas Abruptas (`SIGKILL` / Queda de Processo):**
+  - **Antes do Commit SQL:** O PostgreSQL executa rollback automático das alterações não confirmadas nas 5 tabelas.
+  - **Após o Commit SQL, Antes da Resposta HTTP ou ACK SQS:** Na retentativa/reentrega, `idempotency_key` e `inbox_messages` retornam o snapshot histórico confirmado (`idempotentReplay: true`) e concluem o ACK SQS sem duplicar débitos, créditos ou eventos de Outbox.
+  - **Após Claim da Outbox ou Após `SendMessage` SQS, Antes de `completeOutbox`:** Quando `claimed_until` expira (`10000` ms), outro publisher reivindica e republica o evento (entrega `at-least-once` com `eventId` estável e deduplicação SQS FIFO dentro da janela de 5 minutos).
+
+---
+
+### 21. Migrations Versionadas, Constraints e Proteção contra `NaN` (`FIX-D01`)
+
+O gerenciamento de schema é controlado exclusivamente por migrations versionadas, transacionais e reversíveis registradas em [`src/database/config.ts`](src/database/config.ts) (`transactional: true, allOrNothing: true, snapshot: false`):
+
+1. **[`Migration202611040001.ts`](src/database/migrations/Migration202611040001.ts) (Schema Financeiro Base — SHA-256 `597fb090...`):**
+   - Cria `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages` e `outbox_messages`.
+   - Impõe constraints de unicidade (`uq_wallets_player_currency`, `uq_wager_idempotency`, `uq_wager_provider_external`, `uq_ledger_transaction`, índice único parcial `uq_wager_processed_reversal`, `pk_inbox_messages`).
+   - Impõe invariantes de não-negatividade e estado (`ck_wallet_balance_non_negative`, `ck_wallet_version_positive`, `ck_wager_amount_positive`, `ck_wager_recorded_balance_non_negative`, `ck_wager_status_fields`, `ck_ledger_amount_positive`, `ck_ledger_balances_non_negative`, `ck_ledger_balance_math`, `ck_outbox_claim_all_or_none`).
+   - Instala triggers imediatos bloqueando `UPDATE`/`DELETE` em `wallet_ledger_entries`, bloqueando mutação/exclusão de `wager_transactions` terminais e validando contexto/kind/valor de referências em apostas processadas.
+   - Instala constraint triggers `DEFERRABLE INITIALLY DEFERRED` (`trg_wallet_balance_matches_ledger`, `trg_wager_ledger_consistency`, `trg_ledger_requires_processed_wager`) verificando no `COMMIT` que o `balance` materializado de toda carteira é igual à soma exata de seus lançamentos no ledger e que toda aposta financeira `PROCESSED` possui seu lançamento correspondente.
+2. **[`Migration202611060001.ts`](src/database/migrations/Migration202611060001.ts) (`FIX-D01` Endurecimento de Finitude Monetária — SHA-256 `bcb5d7f0...`):**
+   - **Causa Raiz Endereçada:** O tipo `NUMERIC(18,2)` do PostgreSQL rejeita nativamente `Infinity`/`-Infinity` pelo typmod (`SQLSTATE 22003`), mas admite `'NaN'::numeric`. Como `'NaN'::numeric >= 0` e `'NaN'::numeric = 'NaN'::numeric` avaliam para `TRUE` no PostgreSQL, uma escrita SQL direta contendo `'NaN'::numeric` coordenada entre wallet, wager e ledger podia satisfazer as checagens aritméticas e triggers diferidos anteriores.
+   - **Solução:** Adiciona três constraints `CHECK` imediatas (sem `NOT VALID`) cobrindo todas as seis colunas monetárias `NUMERIC(18,2)`:
+     - `wallets`: `ck_wallet_all_finite CHECK (balance NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric))`
+     - `wager_transactions`: `ck_wager_all_finite CHECK (amount NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) AND recorded_balance_amount NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric))` (`NULL` em `recorded_balance_amount` continua aceito porque `NULL NOT IN (...)` avalia para `UNKNOWN`, o que satisfaz constraints `CHECK` em SQL).
+     - `wallet_ledger_entries`: `ck_ledger_all_finite CHECK (amount NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) AND balance_before NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) AND balance_after NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric))`
+   - **Integridade de Dados Legados e Atomicidade:** Como as constraints são adicionadas sem `NOT VALID` dentro de uma migration transacional, o PostgreSQL valida imediatamente todas as linhas existentes. Qualquer `NaN` legado em qualquer uma das três tabelas aborta a migration `UP` inteira com `SQLSTATE 23514` (`check_violation`), sem reescrever histórico financeiro nem deixar constraints parciais.
+   - **`DOWN` Cirúrgico:** `Migration202611060001.down()` remove **exclusivamente** `ck_ledger_all_finite`, `ck_wager_all_finite` e `ck_wallet_all_finite`, preservando integralmente todas as tabelas, dados, triggers e constraints da `Migration202611040001`.
+
+---
+
+### 22. Health Checks e Observabilidade
+
+- **Endpoints de Health (`HealthController` e `HealthReadiness`):**
+  - `GET /health/live`: Retorna `200 OK` `{ "status": "ok" }`.
+  - `GET /health/ready`: Coalesce verificações concorrentes de readiness em um único voo limitado por timeout (`HEALTH_READINESS_TIMEOUT_MS`, default `1500` ms) executando `PostgresHealthProbe` (`SELECT 1`) e a sonda SQS de `HealthReadiness` (verificando `wager-transactions.fifo`, `wager-transactions-dlq.fifo`, `wagering-events.fifo`, atributos FIFO e `RedrivePolicy`). Retorna `200 OK` quando ambas as dependências estão `"up"`, ou `503 Service Unavailable` (`"not_ready"` ou `"draining"` durante o encerramento).
+- **Métricas Operacionais (`MetricsController` e `DefaultOperationalMetricsCollector`):**
+  - `DatabaseModule` fornece uma única instância de `OPERATIONAL_METRICS` compartilhada entre os casos de uso financeiros e os workers daquele grafo de injeção de dependências.
+  - `GET /metrics` retorna um `OperationalMetricsSnapshot` congelado recursivamente (`scope: "process"`). Contadores saturam em `Number.MAX_SAFE_INTEGER`, labels possuem cardinalidade fixa e `operationalMetricsEmitter` isola exceções, promises rejeitadas e reentrância de observadores para que falhas de observabilidade jamais alterem resultados financeiros.
+- **Logs Estruturados (`operational-logging.ts`):**
+  - Emite logs JSON sanitizados de linha única em `stderr` (`stderrOperationalLog`), propagando `x-correlation-id` e redigindo chaves sensíveis e credenciais.
+
+---
+
+### 23. Autenticação e Ponto de Extensão IdP
+
+Conforme permitido pela Seção 2 de [`technical-challenge.md`](technical-challenge.md), a autenticação externa não foi implementada para concentrar a janela de desenvolvimento em correção financeira, concorrência, idempotência e recuperação distribuída:
+
+- **Ponto de Extensão Explícito no Código:** [`ProviderIdentityGuard`](src/shared/infrastructure/provider-identity.guard.ts) implementa `CanActivate` do NestJS e está aplicado via `@UseGuards(ProviderIdentityGuard)` em [`WalletsController`](src/modules/wallets/infrastructure/wallets.controller.ts) e [`WageringController`](src/modules/wagering/infrastructure/wagering.controller.ts), enquanto [`HealthController`](src/shared/infrastructure/health.controller.ts) permanece aberto.
+- **Desenho de Integração IdP para Produção (Keycloak / Zitadel via OIDC):**
+  1. Implantar um Identity Provider externo compatível com OIDC (Keycloak ou Zitadel) emitindo access tokens JWT assimétricos de curta duração (`RS256` / `ES256`) aos provedores de jogos via OAuth 2.0 `client_credentials`.
+  2. No `ProviderIdentityGuard`, validar o cabeçalho `Authorization: Bearer <token>` contra o endpoint JWKS em cache do IdP, conferindo assinatura criptográfica, `iss` (issuer), `aud` (audience), expiração (`exp`/`nbf`) e escopos exigidos.
+  3. Extrair a claim confiável de identidade do provedor (`provider_id`) do token verificado e vinculá-la ao contexto da requisição, rejeitando qualquer chamada a `POST /wagering/transactions` ou `GET /providers/:providerId/...` cujo `providerId` do corpo/rota divirja do principal autenticado (`403 Forbidden`).
+  4. Manter o SQS em fronteira interna privada (VPC/IAM), onde as mensagens permanecem sujeitas a todas as validações de domínio.
+
+---
+
+### 24. Matriz de Responsabilidade das Garantias e Trade-offs
+
+| Propriedade Financeira / Distribuída | Camada de Domínio (TypeScript) | PostgreSQL 16.6 (Schema / Locks / Triggers) | Protocolo SQS / Workers |
+|---|---|---|---|
+| **Escala decimal exata e ausência de `NaN`/`±Infinity`** | Regex em `Money.from` e `decimal.js` (`precision: 40`), `ExactNumericType` | Typmod `NUMERIC(18,2)` + `ck_wallet_all_finite`, `ck_wager_all_finite`, `ck_ledger_all_finite` (`FIX-D01`) | Serialização como string JSON (`MoneyProps`) |
+| **Saldo de carteira nunca negativo** | Verificação de saldo em `Wallet.debit` | `ck_wallet_balance_non_negative` (`balance >= 0`) | N/A |
+| **Atualizações serializadas por carteira (sem lost update)** | `Money` imutável + incremento de versão | `SELECT ... FROM wallets WHERE id = ? FOR UPDATE` | FIFO `MessageGroupId = walletId` (apenas otimização) |
+| **Correspondência 1:1 entre movimento e ledger imutável** | `Wallet.debit`/`credit` retorna `WalletLedgerEntry` | `uq_ledger_transaction`, trigger append-only, triggers diferidos `trg_wallet_balance_matches_ledger` e `trg_wager_ledger_consistency` | N/A |
+| **Idempotência persistente e detecção de conflito** | `WagerTransaction.assertReplay`, `wagerPayloadHash` | `uq_wager_idempotency`, `uq_wager_provider_external`, `pk_inbox_messages` | `DeleteMessage` (ACK) somente pós-commit |
+| **Reversão única por referência** | `evaluateWager` (`referenceAlreadyReversed`) | Índice único parcial `uq_wager_processed_reversal` | `PendingReferenceWorker` sob lock `Wallet -> Wager` |
+| **Convergência em overflow de `PENDING_REFERENCE`** | `MoneyOverflowError` antes de mutar `Wallet` | `updatePendingWager` atômico (`FAILED` / `INFRASTRUCTURE_PERMANENT`) sob lock `Wallet -> Wager` (`FIX-D02`) | Replay terminal (`422` no HTTP, `ACK` no SQS) |
+| **Nenhum evento publicado antes do commit / zero perda** | `OutboxMessage.enqueue` | Commit atômico de `outbox_messages` + lease fencing com `FOR UPDATE SKIP LOCKED` | Publicação at-least-once em `wagering-events.fifo` |
+
+#### Principais Trade-offs
+
+1. **Lock Pessimista `FOR UPDATE` vs Lock Otimista:** O lock pessimista na linha de `wallets` serializa rajadas sobre uma mesma carteira diretamente no PostgreSQL sem desperdiçar CPU e round-trips em aborts de versão otimista, mantendo carteiras distintas totalmente livres de contenção.
+2. **SQL Parametrizado Explícito em `PostgresFinancialStore` vs Auto-Flush do ORM:** Executar SQL explícito dentro de `EntityManager.transactional()` garante ordem exata de aquisição de locks (`Wallet -> Inbox -> Wager`) e tratamento determinístico de violações de constraints, preservando o gerenciamento de transações e migrations do MikroORM.
+3. **Outbox At-Least-Once com Lease Fencing vs 2PC Distribuído:** Claims `SKIP LOCKED` protegidos por lease evitam acoplar o commit financeiro à disponibilidade do broker SQS e recuperam automaticamente caso um publisher falhe durante o envio, exigindo apenas deduplicação padrão por `eventId` nos consumidores de eventos.
+
+---
+
+### 25. Limitações Conhecidas e Rastreabilidade Histórica dos Pacotes
+
+#### Limitações Conhecidas
+
+- **API Local Sem Autenticação Externa:** O `ProviderIdentityGuard` é um ponto de extensão no-op conforme permitido pelo desafio; integração OIDC é obrigatória antes de exposição em rede não confiável.
+- **Métricas Escopadas ao Processo:** `GET /metrics` expõe o coletor em memória do processo HTTP (`scope: "process"`), sem agregação entre processos.
+- **Coexistência de Envelopes na DLQ:** A fila `wager-transactions-dlq.fifo` pode conter tanto `WagerTransactionDeadLetter` (diagnóstico manual sanitizado para erros permanentes) quanto `WagerTransactionRequested` (redrive nativo do SQS após esgotamento transitório). Ferramentas operacionais devem verificar o campo `type` antes de reprocessar.
+- **Custo de Lock na Validação da Migration:** A `Migration202611060001` valida as linhas existentes imediatamente (sem `NOT VALID`); em tabelas preexistentes volumosas, `ALTER TABLE ... ADD CONSTRAINT` adquire locks e lê as linhas existentes.
+- **TypeScript `skipLibCheck`:** Habilitado conforme recomendação do Bun para contornar conflitos internos de declarações transitivas entre `@types/bun` e `@types/node`, mantendo `strict: true` em todo o código do projeto.
+
+#### Rastreabilidade Histórica dos Pacotes
+
+| Pacote / Marco | Resumo do Escopo Entregue | Documento de Evidência |
+|---|---|---|
+| **IMP-01** | Fundação, bootstrap NestJS, `Money` puro, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage`, `IntegrationEvent` e 93 testes unitários de domínio | [`IMP-01-EVIDENCE.md`](IMP-01-EVIDENCE.md) |
+| **IMP-02** | Persistência PostgreSQL 16.6 + MikroORM 6.6.8, `Migration202611040001`, `PostgresUnitOfWork`, ordem de locks `Wallet -> Inbox -> Wager`, casos de uso financeiros, reconciliação e testes concorrentes com 3 processos | [`IMP-02-EVIDENCE.md`](IMP-02-EVIDENCE.md) |
+| **IMP-03 (`CP-01..05` e `REV3-FIX-01`)** | Adaptadores SQS LocalStack, `SqsWagerConsumer`, `OutboxPublisher` com lease fencing, `PendingReferenceWorker` (TTL Opção A), shutdown coordenado sob `SIGTERM` e testes de entrypoints reais em subprocessos | [`IMP-03-EVIDENCE.md`](IMP-03-EVIDENCE.md) |
+| **IMP-04 (`CP-01..05B` e `FINAL-DELIVERY-01`)** | Controllers HTTP (`WalletsController`, `WageringController`, `HealthController`, `MetricsController`), `HttpExceptionFilter`, logs estruturados sanitizados, métricas operacionais (`G6A` + `G6B`) e `1.205` testes aprovados | [`FINAL-DELIVERY-EVIDENCE.md`](FINAL-DELIVERY-EVIDENCE.md) |
+| **FIX-D01 e FIX-D02 (`FIX-D01-D02-FINAL`)** | `Migration202611060001` rejeitando `NaN`/`±Infinity` nas 6 colunas monetárias, `PendingReferenceWorker` terminalizando `MoneyOverflowError` como `FAILED` (`INFRASTRUCTURE_PERMANENT`), testes multiprocesso/crash `REV-D02-01/02` e `1.243` testes aprovados | [`FIX-D01-EVIDENCE.md`](FIX-D01-EVIDENCE.md), [`FIX-D01-D02-FINAL-EVIDENCE.md`](FIX-D01-D02-FINAL-EVIDENCE.md) |
